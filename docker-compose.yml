@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  intel-api:
+    build: .
+    container_name: intel-api
+    env_file: .env
+    ports:
+      - "4000:4000"
+    volumes:
+      - intel_data:/app/out
+    restart: always
+
+  intel-scheduler:
+    image: ghcr.io/aptible/supercronic:latest
+    container_name: intel-scheduler
+    depends_on:
+      - intel-api
+    volumes:
+      - ./cron/ea-refresh.cron:/etc/crontab:ro
+    env_file: .env
+    entrypoint: ["/usr/local/bin/supercronic", "/etc/crontab"]
+    restart: always
+
+volumes:
+  intel_data:
