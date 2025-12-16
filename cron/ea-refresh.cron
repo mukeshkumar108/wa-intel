@@ -1,4 +1,13 @@
 # CRON_TZ supported by supercronic
-CRON_TZ=Europe/London
-0 8 * * * curl -s -X POST "http://intel-api:4000/open-loops/refresh?hours=12&runType=morning" >/dev/null
-0 20 * * * curl -s -X POST "http://intel-api:4000/open-loops/refresh?hours=12&runType=evening" >/dev/null
+CRON_TZ=UTC
+# Evening (late night)
+0 0  * * * curl -fsS -X POST "http://intel-api:4000/open-loops/refresh?hours=6&runType=evening" -H "Authorization: Bearer ${B_API_KEY}" >/dev/null
+
+# Morning (early)
+0 6  * * * curl -fsS -X POST "http://intel-api:4000/open-loops/refresh?hours=6&runType=morning" -H "Authorization: Bearer ${B_API_KEY}" >/dev/null
+
+# Morning (midday-ish)
+0 12 * * * curl -fsS -X POST "http://intel-api:4000/open-loops/refresh?hours=6&runType=morning" -H "Authorization: Bearer ${B_API_KEY}" >/dev/null
+
+# Evening (early night)
+0 18 * * * curl -fsS -X POST "http://intel-api:4000/open-loops/refresh?hours=6&runType=evening" -H "Authorization: Bearer ${B_API_KEY}" >/dev/null
