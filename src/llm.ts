@@ -18,6 +18,10 @@ export const MODEL_REGISTRY = {
   // coaching / reflection
   coaching: "openai/gpt-5-nano",
   userProfile: "openai/gpt-5-nano",
+
+  // intel facts extraction
+  intelFacts: "openai/gpt-4o-mini",
+  heatTriage: "openai/gpt-4o-mini",
 } as const;
 
 export type ModelDomain = keyof typeof MODEL_REGISTRY;

@@ -6,6 +6,27 @@ import {
   RelationshipSummary,
   DailyStateSnapshot,
 } from "./types.js";
+import { ChatCompletionRequest } from "./openRouterClient.js";
+
+export type HeatTriageChatMessage = { id: string; iso: string; speaker: "ME" | "OTHER"; body: string };
+export type HeatTriageChatSlice = {
+  chatId: string;
+  chatDisplayName: string;
+  messages: HeatTriageChatMessage[];
+};
+
+export type OrchestratorHeatMessage = {
+  speaker: "ME" | "OTHER";
+  type: string;
+  body: string;
+  ts: number;
+};
+
+export type OrchestratorHeatChatSlice = {
+  chatId: string;
+  chatDisplayName: string;
+  messages: OrchestratorHeatMessage[];
+};
 
 // Convert raw messages from Service A into the slimmer shape we send to the LLM.
 export function toSummaryMessages(raw: MessageRecord[]): SummaryRequestMessage[] {
@@ -100,6 +121,103 @@ Return ONLY the JSON object, no markdown.
     messages: [
       { role: "system" as const, content: system },
       { role: "user" as const, content: user },
+    ],
+  };
+}
+
+export function buildHeatTriagePrompt(chats: HeatTriageChatSlice[]): ChatCompletionRequest {
+  const system = `You are a triage assistant. Your job is to route which chats deserve deeper backfill based on intimacy/relationship heat. Return strict JSON only. Do not hallucinate; if uncertain, choose LOW.`.trim();
+
+  const chatSections = chats
+    .map((chat, idx) => {
+      const messages = chat.messages
+        .map((m) => `- [${m.iso}] [id=${m.id}] ${m.speaker}: ${JSON.stringify(m.body)}`)
+        .join("\n");
+      return `Chat ${idx + 1}:\nchatId: ${chat.chatId}\nchatDisplayName: ${chat.chatDisplayName}\nMessages:\n${messages}`;
+    })
+    .join("\n\n");
+
+  const user = `
+You are classifying ME's 1:1 chats. ME = user. OTHER = the counterpart in the chat. Groups are already excluded.
+
+For each chat, return an object with this exact schema:
+{
+  "chatId": string,
+  "chatDisplayName": string,
+  "heatTier": "LOW" | "MED" | "HIGH",
+  "heatScore": number, // 0-10
+  "signals": ["AFFECTION","FLIRT","VULNERABILITY","CONFLICT","PLANNING","CHECKIN","LOGISTICS","DRY","UNKNOWN"],
+  "why": string, // one short sentence
+  "recommendedBackfill": { "immediate": 0 | 100, "scheduled": 0 | 400 },
+  "evidenceMessageId": string | null,
+  "evidenceText": string | null
+}
+
+Rules:
+- Use only the supplied messages; do NOT infer beyond the text. If unsure, pick LOW and keep score low.
+- Be robust to sarcasm and pet names.
+- Signals should only use the allowed enum values; include 1-4 that best justify the tier.
+- Prefer providing evidenceMessageId and evidenceText (substring) when tier is MED or HIGH; if unclear, set them to null.
+- If you provide evidenceMessageId, it MUST match exactly one of the provided message ids for that chat. evidenceText must be a substring of that message body.
+- Map heatTier to backfill: LOW => {immediate:0, scheduled:0}, MED => {immediate:100, scheduled:0}, HIGH => {immediate:100, scheduled:400}.
+- Output strict JSON: { "results": [ ...one object per chat in the SAME order provided... ] } and nothing else.
+
+Chats (newest-last within each chat):
+${chatSections}
+`.trim();
+
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+}
+
+export function buildOrchestratorHeatPrompt(chats: OrchestratorHeatChatSlice[]): ChatCompletionRequest {
+  const system = `You classify relationship intimacy / emotional heat from short chat snippets. Return JSON only.`.trim();
+
+  const chatSections = chats
+    .map((chat, idx) => {
+      const msgs = chat.messages
+        .map((m) => {
+          const iso = new Date(m.ts).toISOString();
+          return `- [${iso}] ${m.speaker} type=${m.type}: ${JSON.stringify(m.body)}`;
+        })
+        .join("\n");
+      return `Chat ${idx + 1}: chatId=${chat.chatId}, displayName=${chat.chatDisplayName}\nMessages:\n${msgs}`;
+    })
+    .join("\n\n");
+
+  const user = `
+You will receive multiple 1:1 chats. ME is the user; OTHER is the counterpart. Null bodies are already replaced with media markers. Do NOT infer names or events that are not present.
+
+Return JSON only in this exact shape:
+{
+  "results": [
+    {
+      "chatId": string,
+      "heatTier": "LOW" | "MED" | "HIGH",
+      "heatScore": number,  // 0-10
+      "reasons": string[]   // up to 3, grounded in observable cues like night messages, affection terms, voice notes, rapid back-and-forth, revoked, etc.
+    }
+  ]
+}
+
+Guidelines:
+- Keep responses deterministic and concise.
+- No deep psychoanalysis. Only "should we prioritize deeper backfill" based on the snippet.
+- If uncertain, lean toward LOW with low score.
+- Reasons must reference observable cues from the messages; no hallucinated facts.
+
+Chats:
+${chatSections}
+`.trim();
+
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
     ],
   };
 }
@@ -506,6 +624,65 @@ Messages (oldest first):
 ${JSON.stringify(messages, null, 2)}
 
 Now produce the RelationshipSummary JSON. Return ONLY the JSON object, no markdown or commentary.
+`.trim();
+
+  return {
+    messages: [
+      { role: "system" as const, content: system },
+      { role: "user" as const, content: user },
+    ],
+  };
+}
+
+export function buildIntelFactsPrompt(params: {
+  chatId: string;
+  messages: SummaryRequestMessage[];
+  hours: number;
+  isGroup: boolean;
+  chatDisplayName?: string | null;
+  mode?: "bootstrap" | "default";
+}): ChatCompletionRequest {
+  const { chatId, messages, hours, isGroup, chatDisplayName, mode } = params;
+  const system = `
+You are an evidence-grounded analyst. This is a WhatsApp transcript. ME is the user.
+Extract only verifiable intel from one chat.
+Rules:
+- Return JSON only in the shape: {"facts":[{...}]}
+- Each fact must include: type ("EVENT"|"EMOTION_CONCERN"|"RELATIONSHIP_DYNAMIC"), epistemicStatus ("event_claim"|"self_report"|"observed_pattern"|"hypothesis"), summary (short), entities (array), evidenceMessageId, evidenceText (verbatim substring of that message), attributedTo ("ME"|"OTHER"|"UNKNOWN"), signalScore (1-5).
+- EVENT must be a real-world happening (met, argued, traveled, scheduled, health incident, decision, purchase). Questions/check-ins/status updates are NOT EVENT.
+${mode === "bootstrap" ? "- Output ONLY RELATIONSHIP_DYNAMIC and EMOTION_CONCERN. Do not output EVENT." : ""}
+- Include time fields only as:
+  - timeCertainty: "explicit" | "implied" | "unknown"
+  - timeMention: raw phrase if present (e.g., "last night", "tomorrow at 7")
+  - when/whenDate ONLY when explicit or strongly implied; otherwise leave null. Never guess.
+- Questions like "how are you/what's on your mind/what projects..." should be RELATIONSHIP_DYNAMIC or dropped if low signal.
+- Micro-logistics or filler ("aww", toilet/loo/bathroom, random video call mentions) should be dropped unless clearly meaningful.
+- If you cannot find evidence for a fact, do not emit it.
+- Prefer fewer, higher-quality facts. Ignore greetings and small talk.
+- Ground everything in the provided messages only.
+`.trim();
+
+  const msgLines = messages
+    .map(
+      (m) =>
+        `[${new Date(m.ts).toISOString()}] id=${m.id} ${m.fromMe ? "ME" : m.displayName ?? m.chatId}: ${m.body ?? ""}`
+    )
+    .join("\n");
+
+  const user = `
+Metadata:
+- chatId: ${chatId}
+- chatDisplayName: ${chatDisplayName ?? "unknown"}
+- isGroup: ${isGroup}
+${isGroup ? "- group chat; only mark attributedTo=ME if fromMe=true" : `- 1:1: participants are ME and ${chatDisplayName ?? "them"}`}
+
+Chat: ${chatId}
+Window: last ${hours} hours
+Messages:
+${msgLines}
+
+Return JSON only:
+{"facts":[{"type":"EVENT","epistemicStatus":"event_claim","attributedTo":"ME","signalScore":4,"summary":"...","entities":["..."],"timeCertainty":"explicit","timeMention":"tomorrow at 7pm","when":"YYYY-MM-DDTHH:MM:SSZ","whenDate":"YYYY-MM-DD","evidenceMessageId":"...","evidenceText":"..."}]}
 `.trim();
 
   return {

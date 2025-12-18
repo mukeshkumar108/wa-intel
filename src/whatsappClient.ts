@@ -135,3 +135,60 @@ export async function fetchMessagesSinceWithMeta(ts: number, limit = 2000): Prom
   const data = res.data as MessagesResponse | MessageRecord[];
   return parseMessagesResponse(data);
 }
+
+type ActiveChat = { chatId: string; isGroup?: boolean; displayName?: string | null; messageCount?: number | null };
+
+export async function fetchActiveChats(limit = 50, includeGroups = false): Promise<ActiveChat[]> {
+  const res = await withRetry(() =>
+    client.get("/api/chats/active", {
+      params: { limit, includeGroups },
+    })
+  );
+  const data = res.data as { chats?: ActiveChat[] } | ActiveChat[];
+  const chats = Array.isArray(data) ? data : data.chats;
+  return chats ?? [];
+}
+
+export async function fetchChatMessagesSince(chatId: string, ts: number, limit = 200): Promise<MessageRecord[]> {
+  const res = await withRetry(() =>
+    client.get(`/api/messages/chat/${encodeURIComponent(chatId)}/since`, {
+      params: { ts, limit },
+    })
+  );
+  const data = res.data as MessagesResponse | MessageRecord[];
+  const { messages } = parseMessagesResponse(data);
+  return messages ?? [];
+}
+
+export async function fetchChatMessagesBefore(
+  chatId: string,
+  ts: number,
+  limit = 200
+): Promise<FetchResult> {
+  const res = await withRetry(() =>
+    client.get(`/api/messages/chat/${encodeURIComponent(chatId)}/before`, {
+      params: { ts, limit },
+    })
+  );
+  const data = res.data as MessagesResponse | MessageRecord[];
+  return parseMessagesResponse(data);
+}
+
+export interface CoverageStatus {
+  directCoveragePct?: number;
+  topChats?: { chatId: string; targetMessages?: number }[];
+  [key: string]: any;
+}
+
+export async function getCoverageStatus(): Promise<CoverageStatus> {
+  const res = await withRetry(() => client.get("/api/coverage/status"));
+  return res.data as CoverageStatus;
+}
+
+export async function setBackfillTargets(targets: { chatId: string; targetMessages: number }[]): Promise<void> {
+  await withRetry(() =>
+    client.post("/api/backfill/targets", {
+      targets,
+    })
+  );
+}

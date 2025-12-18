@@ -14,6 +14,7 @@ import { windowsRouter } from "./routes/windows.js";
 import { meRouter } from "./routes/me.js";
 import { openLoopsRefreshRouter } from "./routes/openLoopsRefresh.js";
 import { onboardingPrimeRouter } from "./routes/onboardingPrime.js";
+import { intelRouter } from "./routes/intel.js";
 import { Request, Response, NextFunction } from "express";
 
 const app = express();
@@ -47,6 +48,7 @@ app.use("/state", stateRouter);
 app.use(windowsRouter);
 app.use("/me", meRouter);
 app.use("/admin", adminRouter);
+app.use(intelRouter);
 
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled error:", err);
