@@ -21,6 +21,10 @@ Node/TypeScript API that turns WhatsApp messages from Service A into an EA‑sty
 - `GET /debug/ea/latest?chatId=...` / `GET /debug/ea/summary?hours=24` – debug runs (no prod impact).
 - Relationships/people/state windows: `/relationships/*`, `/people`, `/state/*`, `/windows/*` (context/insights; not used for plate).
 - Onboarding prime: `POST /onboarding/prime?hours=6` (runs refresh + digest); API-key protected.
+- Intel triage: `POST /intel/radar/run?limitChats=50&limitPerChat=30&includeGroups=false&runType=manual` (LLM heat triage, writes `out/intel/heat_triage_latest.json`).
+- Orchestrator: `GET /intel/orchestrate/status`, `POST /intel/orchestrate/run?force=0&runType=manual&limitChats=50&limitPerChat=30` (coverage readiness + backfill targets).
+- Time-of-day metrics: `POST /intel/metrics/time-of-day/run?limitChats=50&limitPerChat=200&includeGroups=false`, `GET /intel/metrics/time-of-day/latest`, `GET /intel/metrics/time-of-day?days=30` (writes `metrics_timeofday_latest.json`).
+- Daily relationship metrics: `POST /intel/metrics/daily/run?limitChats=50&limitPerChat=500&includeGroups=false&windows=1,7`, `GET /intel/metrics/daily/latest`, `GET /intel/metrics/daily?days=30` (writes `metrics_daily_latest.json`).
 
 ## Running locally
 ```bash
@@ -58,6 +62,11 @@ Required env vars:
 curl -X POST "http://localhost:4000/open-loops/refresh?hours=6&force=true&limit=5000" | jq
 curl "http://localhost:4000/open-loops/active" | jq
 curl "http://localhost:4000/digest/today" | jq
+# intel/metrics quick checks (Bearer required if B_API_KEY set)
+curl -X POST -H "Authorization: Bearer test-key" "http://localhost:4000/intel/radar/run?limitChats=10&limitPerChat=20&includeGroups=false&runType=manual" | jq
+curl -H "Authorization: Bearer test-key" http://localhost:4000/intel/orchestrate/status | jq
+curl -X POST -H "Authorization: Bearer test-key" "http://localhost:4000/intel/metrics/time-of-day/run?limitChats=20&limitPerChat=200&includeGroups=false" | jq
+curl -X POST -H "Authorization: Bearer test-key" "http://localhost:4000/intel/metrics/daily/run?limitChats=20&limitPerChat=500&includeGroups=false&windows=1,7" | jq
 ```
 
 ## Git hygiene
