@@ -22,6 +22,7 @@ export const MODEL_REGISTRY = {
   // intel facts extraction
   intelFacts: "openai/gpt-4o-mini",
   heatTriage: "openai/gpt-4o-mini",
+  signals: "openai/gpt-4o-mini",
 } as const;
 
 export type ModelDomain = keyof typeof MODEL_REGISTRY;

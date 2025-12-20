@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { fetchActiveChats, fetchChatMessagesBefore } from "../whatsappClient.js";
+import { fetchActiveChats, fetchChatMessagesBefore, fetchRecentMessages } from "../whatsappClient.js";
 import type { MessageRecord } from "../types.js";
 
 const OUT_DIR = path.join(process.cwd(), "out", "intel");
@@ -32,6 +32,10 @@ export type TimeOfDaySnapshot = {
   generatedAt: number;
   params: { limitChats: number; limitPerChat: number; includeGroups: boolean };
   results: ChatTimeOfDayMetrics[];
+  totalChats?: number;
+  activeChats?: number;
+  omittedInactiveChats?: number;
+  activeCriteria?: { activeDays?: number; minMsgs?: number; activeOnly?: boolean };
 };
 
 function ensureOutDir() {
@@ -87,21 +91,68 @@ function computeChatMetrics(chatId: string, displayName: string, messages: Messa
   };
 }
 
-export async function runTimeOfDayMetrics(opts: { limitChats: number; limitPerChat: number; includeGroups: boolean }) {
-  const { limitChats, limitPerChat, includeGroups } = opts;
-  const chats = await fetchActiveChats(limitChats, includeGroups);
-  const filtered = chats.filter((c) => {
-    if (c.chatId === "status@broadcast") return false;
-    if (!includeGroups && (c.isGroup || c.chatId.endsWith("@g.us"))) return false;
-    return true;
-  });
+export async function runTimeOfDayMetrics(opts: {
+  limitChats: number;
+  limitPerChat: number;
+  includeGroups: boolean;
+  activeOnly?: boolean;
+  activeDays?: number;
+  recentLimit?: number;
+  maxChats?: number;
+  minMsgs?: number;
+}) {
+  const {
+    limitChats,
+    limitPerChat,
+    includeGroups,
+    activeOnly,
+    activeDays = 30,
+    recentLimit = 4000,
+    maxChats = 50,
+    minMsgs = 0,
+  } = opts;
+  let chatsToProcess: { chatId: string; displayName?: string | null; isGroup?: boolean }[] = [];
+
+  if (activeOnly) {
+    const cutoff = Date.now() - activeDays * 24 * 60 * 60 * 1000;
+    const recent = await fetchRecentMessages(recentLimit);
+    const seen = new Set<string>();
+    const picked: { chatId: string; displayName?: string | null; isGroup?: boolean }[] = [];
+    for (const m of recent) {
+      if (m.ts < cutoff) continue;
+      const isGroup = m.chatId.endsWith("@g.us");
+      if (!includeGroups && isGroup) continue;
+      if (m.chatId === "status@broadcast" || m.chatId.includes("@broadcast")) continue;
+      if (seen.has(m.chatId)) continue;
+      seen.add(m.chatId);
+      picked.push({ chatId: m.chatId });
+      if (picked.length >= maxChats) break;
+    }
+    chatsToProcess = picked;
+  } else {
+    const chats = await fetchActiveChats(limitChats, includeGroups);
+    chatsToProcess = chats.filter((c) => {
+      if (c.chatId === "status@broadcast") return false;
+      if (!includeGroups && (c.isGroup || c.chatId.endsWith("@g.us"))) return false;
+      return true;
+    });
+  }
 
   const results: ChatTimeOfDayMetrics[] = [];
-  for (const chat of filtered) {
+  for (const chat of chatsToProcess) {
     const chatId = chat.chatId;
     const displayName = chat.displayName ?? chatId;
     const { messages } = await fetchChatMessagesBefore(chatId, 0, limitPerChat).catch(() => ({ messages: [] as MessageRecord[] }));
-    results.push(computeChatMetrics(chatId, displayName, messages));
+    const metrics = computeChatMetrics(chatId, displayName, messages);
+    if (minMsgs > 0) {
+      const total =
+        Number(metrics?.counts?.morning ?? 0) +
+        Number(metrics?.counts?.day ?? 0) +
+        Number(metrics?.counts?.evening ?? 0) +
+        Number(metrics?.counts?.night ?? 0);
+      if (total < minMsgs) continue;
+    }
+    results.push(metrics);
   }
 
   const snapshot: TimeOfDaySnapshot = {
@@ -109,6 +160,28 @@ export async function runTimeOfDayMetrics(opts: { limitChats: number; limitPerCh
     generatedAt: Date.now(),
     params: { limitChats, limitPerChat, includeGroups },
     results,
+    totalChats: results.length,
+    activeChats: results.filter((r) => {
+      const total =
+        Number(r?.counts?.morning ?? 0) +
+        Number(r?.counts?.day ?? 0) +
+        Number(r?.counts?.evening ?? 0) +
+        Number(r?.counts?.night ?? 0);
+      return total > 0;
+    }).length,
+    omittedInactiveChats: Math.max(
+      0,
+      results.length -
+        results.filter((r) => {
+          const total =
+            Number(r?.counts?.morning ?? 0) +
+            Number(r?.counts?.day ?? 0) +
+        Number(r?.counts?.evening ?? 0) +
+        Number(r?.counts?.night ?? 0);
+      return total > 0;
+    }).length
+    ),
+    activeCriteria: { activeDays, minMsgs, activeOnly: !!activeOnly },
   };
 
   ensureOutDir();

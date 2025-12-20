@@ -1,0 +1,17 @@
+export const schedulerConfig = {
+  serviceABase: process.env.SERVICE_A_BASE_URL ?? "http://localhost:3000",
+  serviceBBase: process.env.SERVICE_B_BASE_URL ?? "http://localhost:4000",
+  apiKey: process.env.API_KEY ?? process.env.B_API_KEY ?? "",
+  enabled: String(process.env.ORCH_ENABLED ?? "true").toLowerCase() === "true",
+  tz: process.env.ORCH_TZ ?? "Europe/London",
+  tickMs: Number(process.env.ORCH_TICK_MS ?? 60_000),
+  orchestrateMinIntervalMs: Number(process.env.ORCH_ORCHESTRATE_MIN_INTERVAL_MS ?? 300_000),
+  openLoopsMinIntervalMs: Number(process.env.ORCH_OPEN_LOOPS_MIN_INTERVAL_MS ?? 21_600_000),
+  dailyMetricsHour: Number(process.env.ORCH_DAILY_METRICS_HOUR ?? 6),
+  dailyMetricsMinute: Number(process.env.ORCH_DAILY_METRICS_MINUTE ?? 10),
+  minDirectChats: Number(process.env.ORCH_MIN_DIRECT_CHATS ?? 3),
+  minDirectCoveragePct: Number(process.env.ORCH_MIN_DIRECT_COVERAGE_PCT ?? 70),
+  coverageFallbackAfterMs: Number(process.env.ORCH_COVERAGE_FALLBACK_AFTER_MS ?? 7_200_000),
+  jobWorkerEnabled: String(process.env.ORCH_JOB_WORKER_ENABLED ?? "true").toLowerCase() === "true",
+  jobWorkerLimit: Number(process.env.ORCH_JOB_WORKER_LIMIT ?? 2),
+};

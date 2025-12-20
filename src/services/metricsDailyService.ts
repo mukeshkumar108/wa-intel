@@ -1,6 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { fetchActiveChats, fetchChatMessagesBefore } from "../whatsappClient.js";
+import { fetchActiveChats, fetchChatMessagesBefore, fetchRecentMessages } from "../whatsappClient.js";
 import type { MessageRecord } from "../types.js";
 
 const OUT_DIR = path.join(process.cwd(), "out", "intel");
@@ -44,6 +44,10 @@ export type DailyMetricsSnapshot = {
   limitPerChat: number;
   includeGroups: boolean;
   results: ChatDailyMetrics[];
+  totalChats?: number;
+  activeChats?: number;
+  omittedInactiveChats?: number;
+  activeCriteria?: { activeDays?: number; minMsgs?: number; activeOnly?: boolean };
 };
 
 function ensureOutDir() {
@@ -189,26 +193,66 @@ export async function runDailyMetrics(opts: {
   includeGroups: boolean;
   windows: number[];
   tz?: string;
+  activeOnly?: boolean;
+  activeDays?: number;
+  recentLimit?: number;
+  maxChats?: number;
+  minMsgs?: number;
 }) {
-  const { limitChats, limitPerChat, includeGroups, windows, tz } = opts;
+  const {
+    limitChats,
+    limitPerChat,
+    includeGroups,
+    windows,
+    tz,
+    activeOnly,
+    activeDays = 30,
+    recentLimit = 4000,
+    maxChats = 50,
+    minMsgs = 0,
+  } = opts;
   const tzToUse = tz || DEFAULT_TZ;
-  const chats = await fetchActiveChats(limitChats, includeGroups);
-  const filtered = chats.filter((c) => {
-    if (c.chatId === "status@broadcast") return false;
-    if (!includeGroups && (c.isGroup || c.chatId.endsWith("@g.us"))) return false;
-    return true;
-  });
+  let chatsToProcess: { chatId: string; displayName?: string | null; isGroup?: boolean }[] = [];
+
+  if (activeOnly) {
+    const cutoff = Date.now() - activeDays * 24 * 60 * 60 * 1000;
+    const recent = await fetchRecentMessages(recentLimit);
+    const seen = new Set<string>();
+    const picked: { chatId: string }[] = [];
+    for (const m of recent) {
+      if (m.ts < cutoff) continue;
+      const isGroup = m.chatId.endsWith("@g.us");
+      if (!includeGroups && isGroup) continue;
+      if (m.chatId === "status@broadcast" || m.chatId.includes("@broadcast")) continue;
+      if (seen.has(m.chatId)) continue;
+      seen.add(m.chatId);
+      picked.push({ chatId: m.chatId });
+      if (picked.length >= maxChats) break;
+    }
+    chatsToProcess = picked;
+  } else {
+    const chats = await fetchActiveChats(limitChats, includeGroups);
+    chatsToProcess = chats.filter((c) => {
+      if (c.chatId === "status@broadcast") return false;
+      if (!includeGroups && (c.isGroup || c.chatId.endsWith("@g.us"))) return false;
+      return true;
+    });
+  }
 
   const results: ChatDailyMetrics[] = [];
 
-  for (const chat of filtered) {
+  for (const chat of chatsToProcess) {
     const chatId = chat.chatId;
     const displayName = chat.displayName ?? chatId;
     const { messages } = await fetchChatMessagesBefore(chatId, 0, limitPerChat).catch(() => ({ messages: [] as MessageRecord[] }));
     const metricsByWindow: Record<string, WindowMetrics> = {};
+    let hasMinMsgs = false;
     for (const w of windows) {
-      metricsByWindow[String(w)] = computeWindowMetrics(messages, w, tzToUse);
+      const wm = computeWindowMetrics(messages, w, tzToUse);
+      metricsByWindow[String(w)] = wm;
+      if (minMsgs > 0 && wm.msgCountTotal >= minMsgs) hasMinMsgs = true;
     }
+    if (minMsgs > 0 && !hasMinMsgs) continue;
     results.push({ chatId, displayName, metricsByWindow });
   }
 
@@ -220,6 +264,30 @@ export async function runDailyMetrics(opts: {
     limitPerChat,
     includeGroups,
     results,
+    totalChats: results.length,
+    activeChats: results.filter((r) => {
+      const windowsMap = r.metricsByWindow ?? {};
+      return Object.values(windowsMap).some((w: any) => {
+        const msgCount = Number(w?.msgCountTotal ?? 0);
+        const covMsgs = Number(w?.coverage?.messagesInWindow ?? 0);
+        const covQual = w?.coverage?.coverageQuality;
+        return msgCount > 0 || covMsgs > 0 || covQual !== "EMPTY";
+      });
+    }).length,
+    omittedInactiveChats: Math.max(
+      0,
+      results.length -
+        results.filter((r) => {
+          const windowsMap = r.metricsByWindow ?? {};
+          return Object.values(windowsMap).some((w: any) => {
+            const msgCount = Number(w?.msgCountTotal ?? 0);
+            const covMsgs = Number(w?.coverage?.messagesInWindow ?? 0);
+            const covQual = w?.coverage?.coverageQuality;
+            return msgCount > 0 || covMsgs > 0 || covQual !== "EMPTY";
+          });
+        }).length
+    ),
+    activeCriteria: { activeDays, minMsgs, activeOnly: !!activeOnly },
   };
 
   ensureOutDir();
@@ -227,6 +295,18 @@ export async function runDailyMetrics(opts: {
   fs.writeFileSync(LATEST_PATH, JSON.stringify(snapshot, null, 2));
 
   return snapshot;
+}
+
+export async function runDailyMetricsForChat(chatId: string, opts: { windows: number[]; limitPerChat?: number; tz?: string }) {
+  const windows = opts.windows ?? [1, 7, 30];
+  const limitPerChat = opts.limitPerChat ?? 500;
+  const tzToUse = opts.tz || DEFAULT_TZ;
+  const { messages } = await fetchChatMessagesBefore(chatId, 0, limitPerChat).catch(() => ({ messages: [] as MessageRecord[] }));
+  const metricsByWindow: Record<string, WindowMetrics> = {};
+  for (const w of windows) {
+    metricsByWindow[String(w)] = computeWindowMetrics(messages, w, tzToUse);
+  }
+  return { chatId, metricsByWindow, displayName: chatId };
 }
 
 export function readLatestDailyMetrics(): DailyMetricsSnapshot | null {

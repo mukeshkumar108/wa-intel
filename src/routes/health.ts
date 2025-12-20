@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { fetchRecentMessages } from "../whatsappClient.js";
+import { pool } from "../db.js";
 
 export const healthRouter = Router();
 
@@ -28,4 +29,15 @@ healthRouter.get("/health/deps", async (_req, res) => {
       },
     },
   });
+});
+
+healthRouter.get("/db/ping", async (_req, res) => {
+  try {
+    const result = await pool.query("SELECT 1 as ok");
+    const ok = result?.rows?.[0]?.ok ?? 1;
+    res.json({ ok: true, db: { ok } });
+  } catch (err: any) {
+    console.error("DB ping failed:", err);
+    res.status(500).json({ ok: false, error: err?.message ?? String(err) });
+  }
 });

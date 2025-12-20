@@ -28,6 +28,17 @@ export type OrchestratorHeatChatSlice = {
   messages: OrchestratorHeatMessage[];
 };
 
+export type SignalsChat = {
+  chatId: string;
+  messageCount: number;
+  messages: {
+    ts: number;
+    fromMe: boolean;
+    body: string | null;
+    type: string;
+  }[];
+};
+
 // Convert raw messages from Service A into the slimmer shape we send to the LLM.
 export function toSummaryMessages(raw: MessageRecord[]): SummaryRequestMessage[] {
   return raw
@@ -212,6 +223,120 @@ Guidelines:
 
 Chats:
 ${chatSections}
+`.trim();
+
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+}
+
+export function buildSignalsDigestPrompt(opts: { windowHours: number; generatedAtTs: number; chats: SignalsChat[] }): ChatCompletionRequest {
+  const { windowHours, generatedAtTs, chats } = opts;
+  const system = `You are a cautious safety/relationship signals triager. Be conservative. Return JSON only.`.trim();
+  const chatLines = chats
+    .map((c, idx) => {
+      const msgs = c.messages
+        .map((m) => `- [${new Date(m.ts).toISOString()}] ${m.fromMe ? "ME" : "OTHER"} type=${m.type}: ${JSON.stringify(m.body ?? "")}`)
+        .join("\n");
+      return `Chat ${idx + 1}: chatId=${c.chatId}, messageCount=${c.messageCount}\nMessages:\n${msgs}`;
+    })
+    .join("\n\n");
+
+  const user = `
+You will triage chats for concerning or noteworthy relational signals within the last ${windowHours} hours.
+If signal is weak/unclear, return an empty watchlist.
+
+Return JSON exactly in this schema:
+{
+  "windowHours": number,
+  "generatedAtTs": number,
+  "watchlist": [
+    {
+      "chatId": string,
+      "watchScore": number,          // 0-100, higher = more concern/attention
+      "direction": "self" | "other" | "mutual",
+      "tags": ["flirtation","sexual","secrecy","pressure","love_bombing","manipulation","conflict","avoidance","impulsivity"],
+      "summary": string,             // 1-2 lines
+      "evidence": string[],          // <=3 short excerpts
+      "nextAction": string,          // short suggestion
+      "confidence": number           // 0-1
+    }
+  ],
+  "globalPatterns": {
+    "notes": string[]               // <=5 bullets
+  }
+}
+
+Chats:
+${chatLines}
+`.trim();
+
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+}
+
+export function buildSignalsEventsPrompt(opts: {
+  windowHours: number;
+  generatedAtTs: number;
+  maxEvents: number;
+  chats: SignalsChat[];
+}): ChatCompletionRequest {
+  const { windowHours, generatedAtTs, maxEvents, chats } = opts;
+  const system = `You are a cautious relationship/safety signal triager. Return JSON only.`.trim();
+  const chatLines = chats
+    .map((c, idx) => {
+      const msgs = c.messages
+        .map((m) => `- [${new Date(m.ts).toISOString()}] ${m.fromMe ? "ME" : "OTHER"} type=${m.type}: ${JSON.stringify(m.body ?? "")}`)
+        .join("\n");
+      return `Chat ${idx + 1}: chatId=${c.chatId}, messageCount=${c.messageCount}\nMessages:\n${msgs}`;
+    })
+    .join("\n\n");
+
+  const user = `
+You will look for notable relational/safety signals in the last ${windowHours} hours.
+Be conservative: if unsure, return empty events and zero counts.
+
+Return JSON exactly:
+{
+  "windowHours": number,
+  "generatedAtTs": number,
+  "counts": {
+    "sexual_flirt": number,
+    "secrecy_concealment": number,
+    "pressure_coercion": number,
+    "triangulation_undermining": number,
+    "meetup_plan": number,
+    "money_transactional": number,
+    "conflict_threat_abuse": number,
+    "intimacy_confession": number
+  },
+  "events": [
+    {
+      "type": "sexual_flirt" | "secrecy_concealment" | "pressure_coercion" | "triangulation_undermining" | "meetup_plan" | "money_transactional" | "conflict_threat_abuse" | "intimacy_confession",
+      "chatId": string,
+      "ts": number,
+      "direction": "incoming" | "outgoing" | "mutual",
+      "evidence": string[],   // <=3 short excerpts
+      "confidence": number    // 0-1
+    }
+  ]
+}
+
+Rules:
+- Sort events by ts descending.
+- Cap total events to maxEvents=${maxEvents}; keep most recent.
+- If not enough signal, return empty events and zero counts.
+- Base everything strictly on provided messages; no hallucinations.
+
+Chats:
+${chatLines}
 `.trim();
 
   return {

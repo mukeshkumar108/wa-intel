@@ -10,6 +10,9 @@ import { buildRelationshipPrompt, toSummaryMessages } from "../prompts.js";
 import { callLLM, getModelName } from "../llm.js";
 import { getRecentOneToOneChats } from "../routes/people.js";
 import { computeRelationshipMetrics, normalizeRelationshipModel, inferDisplayName } from "../routes/relationships.js";
+import { pool } from "../db.js";
+
+const STAGE1_VERSION = "stage1-v1";
 
 export async function generateRelationshipSnapshot(
   chatId: string,
@@ -82,6 +85,39 @@ export async function generateRelationshipSnapshot(
   };
 
   await saveRelationshipSnapshot(snapshot);
+
+  const profileText = relationship.overallSummary ?? "";
+  if (profileText) {
+    try {
+      await pool.query(
+        `
+        INSERT INTO relationship_profiles (chat_id, profile_text, updated_at, version)
+        VALUES ($1, $2, now(), $3)
+        ON CONFLICT (chat_id) DO UPDATE
+        SET profile_text = EXCLUDED.profile_text,
+            updated_at = EXCLUDED.updated_at,
+            version = EXCLUDED.version
+      `,
+        [chatId, profileText, STAGE1_VERSION]
+      );
+
+      await pool.query(
+        `
+        INSERT INTO chat_pipeline_state (chat_id, stage1_done, stage1_updated_at, stage1_version, last_error)
+        VALUES ($1, true, now(), $2, null)
+        ON CONFLICT (chat_id) DO UPDATE
+        SET stage1_done = EXCLUDED.stage1_done,
+            stage1_updated_at = EXCLUDED.stage1_updated_at,
+            stage1_version = EXCLUDED.stage1_version,
+            last_error = null
+      `,
+        [chatId, STAGE1_VERSION]
+      );
+    } catch (err) {
+      console.error("[relationshipSnapshot] failed to persist to DB", err);
+    }
+  }
+
   return snapshot;
 }
 

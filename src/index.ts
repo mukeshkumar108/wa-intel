@@ -15,7 +15,9 @@ import { meRouter } from "./routes/me.js";
 import { openLoopsRefreshRouter } from "./routes/openLoopsRefresh.js";
 import { onboardingPrimeRouter } from "./routes/onboardingPrime.js";
 import { intelRouter } from "./routes/intel.js";
+import { uiRouter } from "./routes/ui.js";
 import { Request, Response, NextFunction } from "express";
+import { startOrchestratorScheduler } from "./services/orchestratorScheduler.js";
 
 const app = express();
 
@@ -49,6 +51,7 @@ app.use(windowsRouter);
 app.use("/me", meRouter);
 app.use("/admin", adminRouter);
 app.use(intelRouter);
+app.use(uiRouter);
 
 app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error("Unhandled error:", err);
@@ -58,3 +61,5 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 app.listen(config.port, () => {
   console.log(`Intel service listening on http://localhost:${config.port}`);
 });
+
+startOrchestratorScheduler();

@@ -30,6 +30,23 @@ async function withRetry<T>(fn: () => Promise<T>, attempt = 1): Promise<T> {
   }
 }
 
+function isTimeout(err: any): boolean {
+  return err?.code === "ECONNABORTED" || /timeout/i.test(err?.message ?? "");
+}
+
+async function withTimeoutRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (isTimeout(err)) {
+      console.warn("[orchestrator] Service A call timeout, retrying once");
+      await new Promise((r) => setTimeout(r, 500));
+      return fn();
+    }
+    throw err;
+  }
+}
+
 interface MessagesResponse {
   messages: MessageRecord[];
   total?: number;
@@ -174,6 +191,15 @@ export async function fetchChatMessagesBefore(
   return parseMessagesResponse(data);
 }
 
+export async function fetchServiceStatus(): Promise<any> {
+  const res = await withTimeoutRetry(() =>
+    client.get("/status", {
+      timeout: 60_000,
+    })
+  );
+  return res.data;
+}
+
 export interface CoverageStatus {
   directCoveragePct?: number;
   topChats?: { chatId: string; targetMessages?: number }[];
@@ -181,14 +207,22 @@ export interface CoverageStatus {
 }
 
 export async function getCoverageStatus(): Promise<CoverageStatus> {
-  const res = await withRetry(() => client.get("/api/coverage/status"));
+  const res = await withTimeoutRetry(() =>
+    client.get("/api/coverage/status", {
+      timeout: 60_000,
+    })
+  );
   return res.data as CoverageStatus;
 }
 
 export async function setBackfillTargets(targets: { chatId: string; targetMessages: number }[]): Promise<void> {
-  await withRetry(() =>
-    client.post("/api/backfill/targets", {
-      targets,
-    })
+  await withTimeoutRetry(() =>
+    client.post(
+      "/api/backfill/targets",
+      {
+        targets,
+      },
+      { timeout: 60_000 }
+    )
   );
 }
