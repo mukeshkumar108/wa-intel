@@ -36,15 +36,17 @@ export async function finishRun(runId: number | null, { status, error }: FinishR
   }
 }
 
-export async function saveArtifact({ runId, artifactType, chatId, payload }: ArtifactArgs): Promise<void> {
-  if (runId == null) return;
+export async function saveArtifact({ runId, artifactType, chatId, payload }: ArtifactArgs): Promise<number | null> {
+  if (runId == null) return null;
   try {
-    await pool.query(
-      `INSERT INTO intel_artifacts (run_id, artifact_type, chat_id, payload) VALUES ($1, $2, $3, $4)`,
+    const res = await pool.query(
+      `INSERT INTO intel_artifacts (run_id, artifact_type, chat_id, payload) VALUES ($1, $2, $3, $4) RETURNING id`,
       [runId, artifactType, chatId ?? null, payload ?? null]
     );
+    return Number(res?.rows?.[0]?.id ?? null);
   } catch (err) {
     console.error("[intelPersistence] saveArtifact failed", err);
+    return null;
   }
 }
 

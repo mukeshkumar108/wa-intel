@@ -5,6 +5,14 @@ SERVICE_A_BASE_URL="${SERVICE_A_BASE_URL:-http://localhost:3000}"
 SERVICE_B_BASE_URL="${SERVICE_B_BASE_URL:-http://localhost:4000}"
 AUTH_HEADER="${AUTH_HEADER:-Authorization: Bearer test-key}"
 CHAT_ID="${CHAT_ID:-}"
+PG_URL="${DATABASE_URL:-${1-}}"
+
+if [[ -z "${PG_URL}" ]]; then
+  echo "ERROR: Set DATABASE_URL or pass it as first arg" >&2
+  exit 1
+fi
+
+export DATABASE_URL="${PG_URL}"
 
 if [[ -z "${CHAT_ID}" ]]; then
   echo "ERROR: CHAT_ID env is required" >&2
@@ -35,25 +43,37 @@ curl -fsS -X POST -H "${AUTH_HEADER}" \
   "${SERVICE_B_BASE_URL}/intel/backfill/chat/${CHAT_ID}?targetMessages=500" | jq .
 
 echo "== Verifying backfill_target_posted event =="
-node --input-type=module -e "
-  import { pool } from '../dist/db.js';
-  const chatId = '${CHAT_ID}';
-  const since = Date.now() - 24*60*60*1000;
-  const run = async () => {
+CHAT_ID_ENV="${CHAT_ID}" DATABASE_URL="${PG_URL}" node --input-type=module <<'NODE'
+import pg from 'pg';
+
+const chatId = process.env.CHAT_ID_ENV;
+const conn = process.env.DATABASE_URL;
+if (!conn) {
+  console.error('DATABASE_URL is required for DB verification');
+  process.exit(1);
+}
+const pool = new pg.Pool({ connectionString: conn });
+const since = Date.now() - 24 * 60 * 60 * 1000;
+
+const run = async () => {
+  try {
     const res = await pool.query(
-      'select count(*) as count, max(ts) as newest from intel_events where type='\"'\"'backfill_target_posted'\"'\"' and chat_id=$1 and ts >= $2',
+      "select count(*) as count, max(ts) as newest from intel_events where type='backfill_target_posted' and chat_id=$1 and ts >= $2",
       [chatId, since]
     );
     console.log(res.rows[0]);
-    await pool.end();
     const count = Number(res.rows[0]?.count ?? 0);
     if (count < 1) {
       console.error('Missing backfill_target_posted event for chat', chatId);
       process.exit(1);
     }
-  };
-  run();
-"
+  } finally {
+    await pool.end();
+  }
+};
+
+run();
+NODE
 
 echo "== Running watermarks sync =="
 curl -fsS -X POST -H "${AUTH_HEADER}" \
@@ -62,7 +82,10 @@ curl -fsS -X POST -H "${AUTH_HEADER}" \
 echo "== Polling jobs table for drain =="
 for i in {1..5}; do
   node --input-type=module -e "
-    import { pool } from '../dist/db.js';
+    import pg from 'pg';
+    const conn = process.env.DATABASE_URL;
+    if (!conn) { console.error('DATABASE_URL is required'); process.exit(1); }
+    const pool = new pg.Pool({ connectionString: conn });
     const run = async () => {
       const res = await pool.query('select status, count(*) from jobs group by status');
       console.log(res.rows);

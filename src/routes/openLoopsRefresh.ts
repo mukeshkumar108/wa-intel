@@ -18,9 +18,17 @@ openLoopsRefreshRouter.post("/open-loops/refresh", async (req, res) => {
     const limitParam = Number(req.query.limit ?? 5000);
     const maxNewMessages = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 5000;
     const results = await refreshEAOpenLoopsForRecentChats(hours, { force, runType, maxNewMessages });
-    await saveArtifact({ runId, artifactType: "open_loops_refresh_result", payload: { chatsProcessed: results.length } });
+    const artifactPayload = {
+      runId,
+      windowHours: hours,
+      chatsProcessed: results.length,
+      loopsAdded: 0,
+      loopsClosed: 0,
+      evidencePointers: { sample: (results ?? []).slice(0, 5) },
+    };
+    const artifactId = await saveArtifact({ runId, artifactType: "open_loops_refresh_result", payload: artifactPayload });
     await finishRun(runId, { status: "ok" });
-    res.json({ chatsProcessed: results.length });
+    res.json({ ok: true, runId, artifactId, summary: { chatsProcessed: results.length, windowHours: hours } });
   } catch (err: any) {
     await finishRun(runId, { status: "error", error: err?.message ?? String(err) });
     console.error("Error in /open-loops/refresh:", err?.message ?? err);

@@ -10,6 +10,7 @@ import {
   getLastBackfillPostedByChatIds,
   saveBackfillPosts,
   getBackfillPostedEvidence,
+  saveArtifact,
 } from "./intelPersistence.js";
 
 export type OrchestratorState = {
@@ -264,8 +265,15 @@ export async function orchestrateStatus() {
   };
 }
 
-export async function orchestrateRun(opts: { force?: boolean; runType?: string; limitChats?: number; limitPerChat?: number; debug?: boolean }) {
-  const { force = false, runType = "manual", limitChats = 50, limitPerChat = 30, debug = false } = opts;
+export async function orchestrateRun(opts: {
+  force?: boolean;
+  runType?: string;
+  limitChats?: number;
+  limitPerChat?: number;
+  debug?: boolean;
+  runId?: number | null;
+}) {
+  const { force = false, runType = "manual", limitChats = 50, limitPerChat = 30, debug = false, runId = null } = opts;
   const now = Date.now();
   const state = readOrchestratorState();
   const eventPriority = {
@@ -533,6 +541,27 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
       dropReasons.missing_satisfaction_reason = (dropReasons.missing_satisfaction_reason ?? 0) + 1;
     }
   }
+  const computedAt = now;
+  const decisionsForPlan = targetDecisions.map((d) => ({
+    chatId: d.chatId,
+    action: "POST_BACKFILL_TARGETS",
+    signalContext: {
+      chatId: d.chatId,
+      heatTier: d.signals?.heatTier ?? null,
+      heatScore: d.signals?.heatScore ?? null,
+      eventPriority: d.signals?.eventPriority ?? false,
+      coverageTargetMessages: d.coverage?.baselineTarget ?? null,
+      messageCountKnown: d.coverage?.messageCountKnown ?? null,
+      cooldown: {
+        lastPostedAt: d.lastPostedAt ?? null,
+        cooldownMs: ORCH_TARGET_COOLDOWN_MS,
+        remainingMs: d.cooldownRemainingMs ?? null,
+      },
+      filtersApplied: [],
+      computedAt,
+    },
+    reason: d.satisfaction?.satisfied ? d.satisfaction.reason ?? "cooldown_active" : "ok_posted",
+  }));
   const debugCompute = debug
     ? {
         plannedCount: targetDecisions.length,
@@ -553,6 +582,72 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
     : null;
 
   let postedChatIds: string[] = [];
+  const actionsPlanned: any[] = [];
+  const actionsExecuted: any[] = [];
+  const planInputs = { force, runType, limitChats, limitPerChat };
+  let planArtifactId: number | null = null;
+  const guardrails = {
+    maxChats: limitChats,
+    maxTargetsPosted: postCandidates.length,
+    cooldownMs: ORCH_TARGET_COOLDOWN_MS,
+    filters: { excludeBroadcast: true, excludeGroups: true, excludeLid: true },
+    eventPriority: {
+      enabled: ORCH_EVENT_PRIORITY_ENABLED,
+      hours: ORCH_EVENT_PRIORITY_HOURS,
+      maxChats: ORCH_EVENT_PRIORITY_MAX_CHATS,
+      types: ORCH_EVENT_PRIORITY_TYPES,
+    },
+  };
+  const heatPreview = heatResults.slice(0, 5).map((h) => ({ chatId: h.chatId, tier: h.heatTier, score: h.heatScore }));
+  const coverageBaselineCount = targetDecisions.filter((d) => Number.isFinite(d.coverage?.baselineTarget)).length;
+  const coverageBaselineSample = targetDecisions
+    .filter((d) => Number.isFinite(d.coverage?.baselineTarget))
+    .slice(0, 5)
+    .map((d) => ({ chatId: d.chatId, target: d.coverage?.baselineTarget }));
+  const cooldownSample = targetDecisions
+    .filter((d) => d.satisfaction?.satisfied)
+    .slice(0, 5)
+    .map((d) => ({ chatId: d.chatId, lastPostedAt: d.lastPostedAt ?? null, remainingMs: d.cooldownRemainingMs ?? null }));
+  const signalContextSummary = {
+    run: { runType, force, limitChats, limitPerChat },
+    serviceA: serviceAInfo,
+    heatPreview,
+    eventPriority: { ...guardrails.eventPriority, selected: eventPrioritySelected.slice(0, 5) },
+    coverageBaseline: { count: coverageBaselineCount, sample: coverageBaselineSample },
+    cooldown: { count: satisfiedCount, sample: cooldownSample },
+    filters: guardrails.filters,
+    guardrails,
+  };
+  if (postCandidates.length) {
+    actionsPlanned.push({ type: "POST_BACKFILL_TARGETS", targets: postCandidates, reasonCode: "ok_posted", evidence: { count: postCandidates.length } });
+  } else {
+    const noOpReason =
+      satisfiedCount === targetDecisions.length
+        ? "all_candidates_in_cooldown"
+        : targetDecisions.length === 0
+          ? "no_signal_candidates"
+          : "no_planned_targets";
+    actionsPlanned.push({ type: "NO_OP", reasonCode: noOpReason, evidence: { planned: targetDecisions.length, satisfied: satisfiedCount } });
+  }
+  const planPayload: any = {
+    version: 1,
+    runId,
+    createdAtTs: now,
+    inputsSummary: planInputs,
+    decisions: decisionsForPlan,
+    actionsPlanned,
+    actionsExecuted: [],
+    results: {
+      summary: {
+        targetsPlanned: plannedTargets.length,
+        targetsPosted: 0,
+        postedMode: null,
+      },
+    },
+    evidence: { dropReasons, satisfactionReasonCounts, signalContextSummary },
+    guardrails,
+  };
+  planArtifactId = await saveArtifact({ runId, artifactType: "action_plan_snapshot", payload: planPayload });
   try {
     if (postCandidates.length) {
       if (debugPosting) {
@@ -571,6 +666,14 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
       await saveBackfillPosts(postedChatIds.map((chatId) => ({ chatId, ts: now })), null);
       const lastPostedMap = Object.fromEntries(postedChatIds.map((chatId) => [chatId, now]));
       (state as any).lastPostedMap = lastPostedMap;
+      actionsExecuted.push({
+        type: "POST_BACKFILL_TARGETS",
+        postedChatIds,
+        targets: postCandidates,
+        ok: true,
+        reasonCode: "ok_posted",
+        evidence: { postedCount: postedChatIds.length, cooldownMs: ORCH_TARGET_COOLDOWN_MS },
+      });
       try {
         const evidence = await getLastBackfillPostedByChatIds(postedChatIds);
         const written = Object.keys(evidence).length;
@@ -579,6 +682,15 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
             "[orchestrator] invariant violated: missing backfill_target_posted rows",
             { expected: postedChatIds.length, found: written }
           );
+          actionsExecuted.push({
+            type: "POST_BACKFILL_TARGETS",
+            reasonCode: "serviceA_error",
+            ok: false,
+            invariantViolation: {
+              expected: postedChatIds.length,
+              found: written,
+            },
+          });
         }
       } catch (err) {
         console.error("[orchestrator] invariant check failed", err);
@@ -590,6 +702,12 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
     if (debugPosting) {
       debugPosting.error = err?.message ?? String(err);
     }
+    actionsExecuted.push({
+      type: "POST_BACKFILL_TARGETS",
+      reasonCode: "serviceA_error",
+      ok: false,
+      error: err?.message ?? String(err),
+    });
     const result = {
       ok: false,
       error: err?.message ?? "set_targets_failed",
@@ -647,6 +765,9 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
     } catch (err) {
       // best-effort only
     }
+    (result as any).planArtifactId = planArtifactId;
+    (result as any).actionsPlanned = actionsPlanned;
+    (result as any).actionsExecuted = actionsExecuted;
   }
   state.lastRunAt = now;
   state.lastRunType = runType;
@@ -664,7 +785,22 @@ export async function orchestrateRun(opts: { force?: boolean; runType?: string; 
     coverage,
     heatResults,
   });
+  if (planArtifactId) {
+    const planResultPayload = {
+      ...planPayload,
+      actionsExecuted,
+      results: {
+        ok: result.ok,
+        targetsPlanned: result.targetsPlanned,
+        targetsPosted: result.targetsPosted,
+        postedMode: result.postedMode,
+        errors: result.ok ? null : (result as any).error ?? null,
+        evidence: { dropReasons, satisfactionReasonCounts },
+      },
+    };
+    await saveArtifact({ runId, artifactType: "action_plan_result", payload: planResultPayload });
+  }
   fs.writeFileSync(HEAT_LATEST_PATH, JSON.stringify({ ts: now, heatResults, params: { limitChats, limitPerChat } }, null, 2));
 
-  return { ...result, targets: postCandidates };
+  return { ...result, targets: postCandidates, planArtifactId };
 }

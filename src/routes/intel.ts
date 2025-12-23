@@ -1,4 +1,6 @@
 import { Router } from "express";
+import fs from "fs";
+import path from "path";
 import { bootstrapIntel, recentIntelFacts } from "../services/intelService.js";
 import { runRadar } from "../services/radarService.js";
 import { orchestrateRun, orchestrateStatus } from "../services/orchestratorService.js";
@@ -146,6 +148,43 @@ intelRouter.post("/intel/bootstrap", async (req, res) => {
   }
 });
 
+intelRouter.get("/intel/ops/runbook", async (_req, res) => {
+  try {
+    const runs = await pool.query(
+      "SELECT kind, MAX(started_at) as last_started_at, MAX(finished_at) as last_finished_at FROM intel_runs GROUP BY kind"
+    );
+    const jobs = await pool.query("SELECT status, type, count(*) FROM jobs GROUP BY status, type");
+    const events = await pool.query(
+      "SELECT COUNT(*) as count FROM intel_events WHERE type = 'backfill_target_posted' AND ts >= (extract(epoch from now())*1000 - 24*60*60*1000)"
+    );
+    let schedulerState: any = {};
+    try {
+      const raw = fs.readFileSync(path.join(process.cwd(), "out", "intel", "orchestrator_state.json"), "utf8");
+      schedulerState = JSON.parse(raw);
+    } catch {}
+    const keyEndpoints = [
+      "/intel/orchestrate/run",
+      "/intel/orchestrate/explain",
+      "/intel/coverage/active",
+      "/intel/metrics/daily/run",
+      "/intel/metrics/time-of-day/run",
+      "/intel/signals/events/run",
+      "/intel/backfill/chat/:chatId",
+      "/open-loops/refresh",
+    ];
+    res.json({
+      keyEndpoints,
+      runs: runs.rows ?? [],
+      jobs: jobs.rows ?? [],
+      backfillPostedLast24h: Number(events.rows?.[0]?.count ?? 0),
+      scheduler: { lastErrors: schedulerState.lastErrors ?? [], lastTickAt: schedulerState.lastTickAt ?? null, tickId: schedulerState.lastTickId ?? null },
+    });
+  } catch (err: any) {
+    console.error("Error in /intel/ops/runbook:", err);
+    res.status(500).json({ error: "Failed to load ops runbook" });
+  }
+});
+
 intelRouter.get("/intel/facts/recent", async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 500);
@@ -202,14 +241,94 @@ intelRouter.post("/intel/orchestrate/run", async (req, res) => {
     const limitChats = Math.min(Number(req.query.limitChats ?? 50) || 50, 500);
     const limitPerChat = Math.min(Number(req.query.limitPerChat ?? 30) || 30, 2000);
     const debug = String(req.query.debug ?? "false").toLowerCase() === "true";
-    const result = await orchestrateRun({ force, runType, limitChats, limitPerChat, debug });
+    const result = await orchestrateRun({ force, runType, limitChats, limitPerChat, debug, runId });
     await saveArtifact({ runId, artifactType: "orchestrate_result", payload: result });
     await finishRun(runId, { status: "ok" });
-    res.json(result);
+    if (debug) {
+      res.json({
+        ok: (result as any).ok ?? false,
+        runId,
+        planArtifactId: (result as any).planArtifactId ?? null,
+        actionsPlanned: (result as any).actionsPlanned ?? [],
+        actionsExecuted: (result as any).actionsExecuted ?? [],
+        targetsPlanned: (result as any).targetsPlanned ?? 0,
+        targetsPosted: (result as any).targetsPosted ?? 0,
+        postedMode: (result as any).postedMode ?? "none",
+        errors: (result as any).error ?? null,
+        serviceASummary: (result as any).serviceA ?? null,
+        eventPriority: (result as any).eventPriority ?? null,
+      });
+    } else {
+      res.json(result);
+    }
   } catch (err: any) {
     await finishRun(runId, { status: "error", error: err?.message ?? String(err) });
     console.error("Error in /intel/orchestrate/run:", err);
     res.status(500).json({ error: "Failed to run orchestrator" });
+  }
+});
+
+intelRouter.get("/intel/orchestrate/explain", async (_req, res) => {
+  try {
+    const runIdParam = _req.query.runId ? Number(_req.query.runId) : null;
+    const latestParam = (_req.query.latest as string | undefined)?.toLowerCase();
+    let runId = runIdParam;
+    if (!runId && latestParam) {
+      const runs = await pool.query(
+        "SELECT id FROM intel_runs WHERE kind='orchestrate_run' AND run_type = $1 ORDER BY started_at DESC LIMIT 1",
+        [latestParam]
+      );
+      runId = runs.rows?.[0]?.id ?? null;
+    }
+    let snapshot;
+    if (runId) {
+      const snapRes = await pool.query(
+        "SELECT id, run_id, payload, created_at FROM intel_artifacts WHERE artifact_type = 'action_plan_snapshot' AND run_id = $1 ORDER BY id DESC LIMIT 1",
+        [runId]
+      );
+      snapshot = snapRes.rows?.[0];
+    } else {
+      const snapRes = await pool.query(
+        "SELECT id, run_id, payload, created_at FROM intel_artifacts WHERE artifact_type = 'action_plan_snapshot' ORDER BY id DESC LIMIT 1"
+      );
+      snapshot = snapRes.rows?.[0];
+    }
+    if (!snapshot) return res.status(404).json({ error: "No action plan found" });
+    const resultRes = await pool.query(
+      "SELECT id, run_id, payload, created_at FROM intel_artifacts WHERE artifact_type = 'action_plan_result' AND run_id = $1 ORDER BY id DESC LIMIT 1",
+      [snapshot.run_id]
+    );
+    const result = resultRes.rows?.[0] ?? null;
+    res.json({ snapshot, result });
+  } catch (err: any) {
+    console.error("Error in /intel/orchestrate/explain:", err);
+    res.status(500).json({ error: "Failed to load action plan" });
+  }
+});
+
+intelRouter.get("/intel/health/summary", async (_req, res) => {
+  try {
+    const runs = await pool.query(
+      "SELECT kind, MAX(started_at) as last_started_at, MAX(finished_at) as last_finished_at FROM intel_runs GROUP BY kind"
+    );
+    const jobs = await pool.query("SELECT status, type, count(*) FROM jobs GROUP BY status, type");
+    const events = await pool.query(
+      "SELECT COUNT(*) as count FROM intel_events WHERE type = 'backfill_target_posted' AND ts >= (extract(epoch from now())*1000 - 24*60*60*1000)"
+    );
+    let schedulerState: any = {};
+    try {
+      const raw = fs.readFileSync(path.join(process.cwd(), "out", "intel", "orchestrator_state.json"), "utf8");
+      schedulerState = JSON.parse(raw);
+    } catch {}
+    res.json({
+      runs: runs.rows ?? [],
+      jobs: jobs.rows ?? [],
+      backfillPostedLast24h: Number(events.rows?.[0]?.count ?? 0),
+      scheduler: { lastErrors: schedulerState.lastErrors ?? [], lastTickAt: schedulerState.lastTickAt ?? null, tickId: schedulerState.lastTickId ?? null },
+    });
+  } catch (err: any) {
+    console.error("Error in /intel/health/summary:", err);
+    res.status(500).json({ error: "Failed to load health summary" });
   }
 });
 

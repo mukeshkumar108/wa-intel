@@ -40,3 +40,13 @@ What it does:
 - Inspect backfill targets in A: `curl -s ${SERVICE_A_BASE_URL:-http://localhost:3000}/api/debug/state | jq '.backfillTargets'`
 - Recent backfill events: `psql ... -c "select chat_id, ts from intel_events where type='backfill_target_posted' order by ts desc limit 20;"`
 - Latest intel artifacts for a chat: `curl -s -H "${AUTH_HEADER:-Authorization: Bearer test-key}" ${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/chat/$CHAT_ID/latest | jq`
+
+## Golden path manual checklist (no script)
+1) Confirm Service A ready: `curl -s ${SERVICE_A_BASE_URL:-http://localhost:3000}/status | jq '{state,startupInfillStatus}'` (expect connected + done).
+2) Inspect coverage/targets: `curl -s -H "${AUTH_HEADER:-Authorization: Bearer test-key}" ${SERVICE_A_BASE_URL:-http://localhost:3000}/api/debug/state | jq '.backfillTargets'`.
+3) Post a backfill target manually (Service B): `curl -s -X POST -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/backfill/chat/$CHAT_ID?targetMessages=500"`.
+4) Run orchestrate: `curl -s -X POST -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/orchestrate/run?runType=manual&debug=true" | jq`.
+5) Check explain/action plan: `curl -s -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/orchestrate/explain?latest=manual" | jq`.
+6) Verify backfill events: `psql ... -c "select chat_id, ts from intel_events where type='backfill_target_posted' order by ts desc limit 20;"`.
+7) Verify artifacts: `curl -s -H "${AUTH_HEADER}" ${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/chat/$CHAT_ID/latest | jq`.
+8) Review health: `curl -s -H "${AUTH_HEADER}" ${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/health/summary | jq`.
