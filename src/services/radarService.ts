@@ -1,9 +1,8 @@
 import fs from "fs";
 import path from "path";
-import { fetchActiveChats, fetchChatMessagesBefore } from "../whatsappClient.js";
-import type { MessageRecord } from "../types.js";
 import { callLLM } from "../llm.js";
 import { buildHeatTriagePrompt, HeatTriageChatSlice } from "../prompts.js";
+import { getActiveChats, getRecentMessages } from "../intel/messageStore.js";
 
 type HeatTier = "LOW" | "MED" | "HIGH";
 
@@ -72,7 +71,7 @@ function truncateBody(body: string | null): string {
   return body.length > 280 ? body.slice(0, 280) : body;
 }
 
-function toChatSlice(chatId: string, displayName: string, messages: MessageRecord[]): HeatTriageChatSlice {
+function toChatSlice(chatId: string, displayName: string, messages: { id: string; ts: number; body: string; fromMe: boolean }[]): HeatTriageChatSlice {
   const sorted = [...messages].sort((a, b) => a.ts - b.ts);
   return {
     chatId,
@@ -147,12 +146,14 @@ function validateEvidence(result: HeatTriageTopChat, messages: { id: string; bod
 
 export async function runRadar(params: RadarParams) {
   const { limitChats, limitPerChat, includeGroups, runType = "manual", execute } = params;
-  const chats = await fetchActiveChats(limitChats, includeGroups);
+  const chats = await getActiveChats(limitChats);
   const filteredChats = chats.filter((c) => {
-    if (c.chatId === "status@broadcast") return false;
+    const chatId = c.chatId;
+    if (!chatId) return false;
+    if (chatId === "status@broadcast") return false;
     if (includeGroups) return true;
-    if (c.isGroup) return false;
-    if (c.chatId.endsWith("@g.us")) return false;
+    if (chatId.endsWith("@g.us")) return false;
+    if (chatId.includes("@broadcast")) return false;
     return true;
   });
 
@@ -161,11 +162,18 @@ export async function runRadar(params: RadarParams) {
 
   for (const chat of filteredChats) {
     const chatId = chat.chatId;
-    const { messages } = await fetchChatMessagesBefore(chatId, 0, limitPerChat).catch(() => ({
-      messages: [] as MessageRecord[],
-    }));
-    messagesProcessed += messages.length;
-    chatSlices.push(toChatSlice(chatId, chat.displayName ?? chatId, messages));
+    const msgs = await getRecentMessages(chatId, limitPerChat).catch(() => [] as any[]);
+    const normalized = msgs
+      .filter((m) => m && typeof m.id === "string")
+      .map((m) => ({
+        id: m.id,
+        ts: Number.isFinite(m.ts) ? Number(m.ts) : 0,
+        body: typeof m.content === "string" ? m.content : "",
+        fromMe: m.role === "me",
+      }));
+    messagesProcessed += normalized.length;
+    if (!normalized.length) continue;
+    chatSlices.push(toChatSlice(chatId, chatId, normalized));
   }
 
   const batches = chunk(chatSlices, BATCH_SIZE);

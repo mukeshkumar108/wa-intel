@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
 import { ActiveOpenLoop, getCuratedPlateOpenLoops } from "../services/openLoopsV2Service.js";
-import { upsertOverride } from "../openLoopOverridesStore.js";
+import { updateLoopStatus } from "../services/openLoopsPersistence.js";
+import { pool } from "../db.js";
 
 export const openLoopsRouter = Router();
 
@@ -12,12 +13,11 @@ const daysSchema = z
     message: "days must be between 1 and 60",
   });
 
-async function resolveOverrideKey(id: string): Promise<{ key: string } | null> {
-  const plate = await getCuratedPlateOpenLoops(30);
-  const loop = plate.openLoops.find((l) => l.id === id);
-  if (!loop) return null;
-  const key = loop.loopKey ? `${loop.chatId}|${loop.loopKey}` : loop.id;
-  return { key };
+async function resolveLoop(id: string): Promise<{ chatId: string; loopId: string } | null> {
+  const res = await pool.query("SELECT chat_id, loop_id FROM open_loops WHERE loop_id = $1 LIMIT 1", [id]);
+  const row = res.rows?.[0];
+  if (!row) return null;
+  return { chatId: row.chat_id, loopId: row.loop_id };
 }
 
 // GET /open-loops?limit=<n>
@@ -63,9 +63,9 @@ openLoopsRouter.get("/open-loops/active", async (req, res) => {
 openLoopsRouter.post("/open-loops/:id/complete", async (req, res) => {
   try {
     const { id } = req.params;
-    const resolved = await resolveOverrideKey(id);
+    const resolved = await resolveLoop(id);
     if (!resolved) return res.status(404).json({ error: "Open loop not found" });
-    await upsertOverride({ key: resolved.key, status: "done", updatedAt: Date.now() });
+    await updateLoopStatus(resolved.chatId, resolved.loopId, { status: "done" });
     res.json({ ok: true });
   } catch (err: any) {
     console.error("Error in /open-loops/:id/complete:", err?.message ?? err);
@@ -77,9 +77,9 @@ openLoopsRouter.post("/open-loops/:id/complete", async (req, res) => {
 openLoopsRouter.post("/open-loops/:id/dismiss", async (req, res) => {
   try {
     const { id } = req.params;
-    const resolved = await resolveOverrideKey(id);
+    const resolved = await resolveLoop(id);
     if (!resolved) return res.status(404).json({ error: "Open loop not found" });
-    await upsertOverride({ key: resolved.key, status: "dismissed", updatedAt: Date.now() });
+    await updateLoopStatus(resolved.chatId, resolved.loopId, { status: "dismissed" });
     res.json({ ok: true });
   } catch (err: any) {
     console.error("Error in /open-loops/:id/dismiss:", err?.message ?? err);
@@ -96,10 +96,10 @@ openLoopsRouter.post("/open-loops/:id/snooze", async (req, res) => {
     const { id } = req.params;
     const parsed = snoozeSchema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: parsed.error.message });
-    const resolved = await resolveOverrideKey(id);
+    const resolved = await resolveLoop(id);
     if (!resolved) return res.status(404).json({ error: "Open loop not found" });
     const snoozeUntil = Date.now() + parsed.data.hours * 60 * 60 * 1000;
-    await upsertOverride({ key: resolved.key, snoozeUntil, updatedAt: Date.now() });
+    await updateLoopStatus(resolved.chatId, resolved.loopId, { snoozeUntil, status: undefined });
     res.json({ ok: true, snoozeUntil });
   } catch (err: any) {
     console.error("Error in /open-loops/:id/snooze:", err?.message ?? err);

@@ -1,13 +1,10 @@
 import crypto from "node:crypto";
 import { loadWindowAnalysesForLastDays } from "../windowAnalysisStore.js";
 import { WindowOpenLoop } from "../types.js";
-import { applyOverrides, loadOverrides } from "../openLoopOverridesStore.js";
 import { callLLM } from "../llm.js";
-import { loadAllEAOpenLoops } from "./eaOpenLoopsService.js";
 import { normalizeWhen } from "../utils/when.js";
-import { getRecentOneToOneChats } from "../routes/people.js";
 import { fallbackNameFromChatId } from "../utils/displayName.js";
-import { fetchContacts } from "../whatsappClient.js";
+import { pool } from "../db.js";
 
 function clampWhen(loop: any) {
   const parsed = normalizeWhen(loop.when ?? null, loop.whenDate ?? null);
@@ -469,76 +466,67 @@ export async function getActiveOpenLoopsFromWindows(days: number): Promise<Activ
 }
 
 export async function getCuratedPlateOpenLoops(days: number): Promise<{ openLoops: ActiveOpenLoop[]; narrativeSummary?: string; meta?: any }> {
-  // EA chat-based loops are the sole source for the plate. If none, return empty.
-  const eaLoops: any[] = await loadAllEAOpenLoops();
-  const preCount = eaLoops.length;
+  const now = Date.now();
+  const since = now - days * 24 * 60 * 60 * 1000;
+  const rows = await pool
+    .query(
+      `
+      SELECT loop_id, chat_id, summary, type, status, urgency, importance, confidence,
+             when_ts, when_date, has_time, lane, lane_override, snooze_until, override_note,
+             first_seen_ts, last_seen_ts, payload
+      FROM open_loops
+      WHERE (status IS NULL OR status != 'dismissed')
+        AND (snooze_until IS NULL OR snooze_until <= $2)
+        AND (last_seen_ts IS NULL OR last_seen_ts >= $1)
+      ORDER BY last_seen_ts DESC NULLS LAST
+      LIMIT 1000
+      `,
+      [since, now]
+    )
+    .then((r) => r.rows ?? []);
 
-  // If EA loops exist, return them directly (with overrides) without canonical merge/curation.
-  if (eaLoops.length > 0) {
-    const overrides = await loadOverrides();
-    const contactsMap = await (async () => {
-      try {
-        const contacts = await fetchContacts(500);
-        const map = new Map<string, { displayName?: string | null; isGroup?: boolean }>();
-        for (const c of contacts) {
-          map.set(c.chatId, { displayName: c.displayName ?? c.pushname ?? c.savedName, isGroup: c.isGroup });
-        }
-        return map;
-      } catch {
-        return new Map<string, { displayName?: string | null; isGroup?: boolean }>();
-      }
-    })();
-    const peopleMap = await (async () => {
-      try {
-        const { people } = await getRecentOneToOneChats(365, 500);
-        const map = new Map<string, string>();
-        for (const p of people) map.set(p.chatId, p.displayName ?? p.chatId);
-        return map;
-      } catch {
-        return new Map<string, string>();
-      }
-    })();
-    const mapped: ActiveOpenLoop[] = eaLoops.map((l) => {
-      const surfaceType: ActiveOpenLoop["surfaceType"] =
-        l.type === "reply_needed" || l.type === "decision_needed" || l.type === "todo" || l.type === "event_date" || l.type === "info_to_save"
-          ? l.type
-          : "info_to_save";
-      return {
-        ...l,
-        chatId: l.chatId ?? "unknown",
-        displayName:
-          l.displayName ??
-          contactsMap.get(l.chatId ?? "")?.displayName ??
-          peopleMap.get(l.chatId ?? "") ??
-          fallbackNameFromChatId(l.chatId ?? "unknown"),
-        isGroup:
-          typeof l.isGroup === "boolean"
-            ? l.isGroup
-            : contactsMap.get(l.chatId ?? "")?.isGroup ?? !!(l.chatId && l.chatId.includes("@g.us")),
-        status: l.status ?? "open",
-        blocked: (l as any).blocked ?? false,
-        surfaceType,
-        nextActions: mapNextActions({ ...l, surfaceType } as ActiveOpenLoop),
-        lastSeenTs: (l as any).lastSeenTs ?? Date.now(),
-      };
-    });
-    const consolidated = consolidateEA(mapped);
-    const withOverrides = applyOverrides(mapped, overrides).filter((l) => l.status !== "dismissed");
-    const sortedEA = sortActiveLoops(consolidated).slice(0, 10);
-    const withLane = sortedEA.map((l) => ({ ...l, lane: computeLane(l) }));
-    if (process.env.DEBUG_INTEL === "1") {
-      console.info("[openLoops] EA plate counts", {
-        pre: preCount,
-        afterOverride: withOverrides.length,
-        curated: withLane.length,
-      });
-      console.info("[openLoops] source selection", { eaCount: eaLoops.length, windowCount: 0, sourceUsed: "ea" });
-    }
-    return { openLoops: withLane, meta: { sourceUsed: "ea", eaCount: eaLoops.length, windowCount: 0 } };
-  }
+  const nowFiltered = rows.filter((r: any) => !r.snooze_until || r.snooze_until <= now);
+  const mapped: ActiveOpenLoop[] = nowFiltered.map((r: any) => {
+    const payload = r.payload ?? {};
+    const surfaceType: ActiveOpenLoop["surfaceType"] =
+      r.type === "reply_needed" || r.type === "decision_needed" || r.type === "todo" || r.type === "event_date" || r.type === "info_to_save"
+        ? r.type
+        : "info_to_save";
+    const displayName =
+      payload.displayName ??
+      payload.chatDisplayName ??
+      fallbackNameFromChatId(r.chat_id ?? "unknown");
+    const isGroup =
+      typeof payload.isGroup === "boolean"
+        ? payload.isGroup
+        : !!(r.chat_id && String(r.chat_id).includes("@g.us"));
+    return {
+      id: r.loop_id ?? r.id ?? crypto.randomUUID(),
+      chatId: r.chat_id,
+      summary: r.summary ?? payload.summary ?? "",
+      type: r.type ?? payload.type ?? "info_to_save",
+      status: r.status ?? "open",
+      urgency: r.urgency ?? payload.urgency ?? "low",
+      importance: r.importance ?? payload.importance ?? 1,
+      confidence: r.confidence ?? payload.confidence ?? 0.5,
+      when: r.when_ts ?? payload.when ?? null,
+      whenDate: r.when_date ?? payload.whenDate ?? null,
+      hasTime: r.has_time ?? payload.hasTime ?? false,
+      lane: (r.lane_override as any) ?? r.lane ?? payload.lane ?? computeLane(payload as any),
+      laneOverride: r.lane_override ?? undefined,
+      surfaceType,
+      nextActions: mapNextActions({ ...(payload as any), surfaceType } as ActiveOpenLoop),
+      lastSeenTs: r.last_seen_ts ?? payload.lastSeenTs ?? Date.now(),
+      firstSeenTs: r.first_seen_ts ?? payload.firstSeenTs ?? null,
+      displayName,
+      isGroup,
+      overrideNote: r.override_note ?? undefined,
+      actor: payload.actor ?? "me",
+      timesMentioned: payload.timesMentioned ?? 1,
+    };
+  });
 
-  if (process.env.DEBUG_INTEL === "1") {
-    console.warn("[openLoops] source selection", { eaCount: 0, windowCount: 0, sourceUsed: "none", warning: "EA store empty; plate intentionally empty (no window fallback)" });
-  }
-  return { openLoops: [], meta: { sourceUsed: "none", eaCount: 0, windowCount: 0 } };
+  const sorted = sortActiveLoops(mapped).slice(0, 10).map((l) => ({ ...l, lane: l.lane ?? computeLane(l) }));
+
+  return { openLoops: sorted, meta: { sourceUsed: "db", count: sorted.length } };
 }

@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { callLLM, getModelName } from "../llm.js";
-import { fetchMessagesSinceWithMeta, FetchResult } from "../whatsappClient.js";
 import { buildEAOpenLoopsV1Prompt } from "../prompts.js";
 import { toSummaryMessages } from "../prompts.js";
 import {
@@ -11,13 +10,53 @@ import {
   upsertChatEAState,
   clearChatEAState,
 } from "../stores/chatEAStateStore.js";
-import { getCursor, setCursor } from "../stores/chatCursorStore.js";
+import { getOpenLoopCursor, saveOpenLoopCursor, saveActiveLoopsToDb, saveDebugRunToDb } from "./openLoopsPersistence.js";
 import fs from "fs/promises";
 import path from "path";
 import { normalizeWhen } from "../utils/when.js";
 import { appendRun, DropRecord } from "../stores/eaDebugRunsStore.js";
+import { pool } from "../db.js";
+import { getChatMessagesSince, getRecentMessagesSince } from "../intel/messageStore.js";
 
 const DEFAULT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const dbOnly = String(process.env.OPEN_LOOPS_DB_ONLY ?? "false").toLowerCase() === "true";
+
+async function loadPriorState(chatId: string): Promise<ChatEAState | null> {
+  if (dbOnly) {
+    try {
+      const res = await pool.query(
+        "SELECT loop_id, chat_id, summary, type, status, urgency, importance, confidence, when_ts, when_date, has_time, last_seen_ts, payload FROM open_loops WHERE chat_id = $1",
+        [chatId]
+      );
+      const loops: EAOpenLoop[] = (res.rows ?? []).map((r: any) => ({
+        id: r.loop_id,
+        chatId: r.chat_id,
+        summary: r.summary ?? r.payload?.summary ?? "",
+        type: r.type ?? r.payload?.type ?? "info_to_save",
+        status: r.status ?? "open",
+        urgency: r.urgency ?? r.payload?.urgency ?? "low",
+        importance: r.importance ?? r.payload?.importance ?? 1,
+        confidence: r.confidence ?? r.payload?.confidence ?? 0.5,
+        when: r.when_ts ?? r.payload?.when ?? null,
+        whenDate: r.when_date ?? r.payload?.whenDate ?? null,
+        hasTime: r.has_time ?? r.payload?.hasTime ?? false,
+        lastSeenTs: r.last_seen_ts ?? r.payload?.lastSeenTs ?? Date.now(),
+        actor: "me",
+      }));
+      return {
+        id: "chat-ea-state",
+        chatId,
+        updatedAt: Date.now(),
+        lastProcessedMessageTs: Math.max(...loops.map((l) => l.lastSeenTs ?? 0), 0),
+        openLoops: loops,
+        modelUsed: getModelName("openLoops"),
+      };
+    } catch (err) {
+      console.error("[ea-openloops] loadPriorState db failed", err);
+    }
+  }
+  return await getLatestChatEAState(chatId);
+}
 
 function normalizeKey(text: string): string {
   return text.toLowerCase().replace(/[^\w]+/g, " ").replace(/\s+/g, " ").trim();
@@ -284,33 +323,28 @@ export async function refreshEAOpenLoopsForChat(chatId: string, opts: { force?: 
   const force = !!opts.force;
   const maxNewMessages = opts.maxNewMessages ?? 5000;
   const runType = deriveRunType(opts.runType);
-  const priorState = force ? null : await getLatestChatEAState(chatId);
-  const cursor = force ? null : await getCursor(chatId);
+  const priorState = force ? null : await loadPriorState(chatId);
+  const cursor = force ? null : await getOpenLoopCursor(chatId);
   const windowHours = opts.hours ?? 48;
   const now = Date.now();
   const baseFrom = now - windowHours * 60 * 60 * 1000;
   const sinceTs = force ? baseFrom : Math.max(baseFrom, (cursor?.lastRunToTs ?? 0) - 5 * 60 * 1000);
 
-  const fetchResult: FetchResult = await fetchMessagesSinceWithMeta(sinceTs, maxNewMessages).catch(
-    () => ({ messages: [] } as FetchResult)
-  );
-  let rawMessages = fetchResult.messages ?? [];
-  rawMessages = rawMessages.filter((m) => m.chatId === chatId);
+  const rawMessages = await getChatMessagesSince(chatId, sinceTs, maxNewMessages);
   rawMessages.sort((a, b) => a.ts - b.ts);
   const lastTs = rawMessages.length ? rawMessages[rawMessages.length - 1].ts : sinceTs;
   const lastMessageId = rawMessages.length ? rawMessages[rawMessages.length - 1].id : undefined;
-  const messages = toSummaryMessages(rawMessages);
+  const messages = toSummaryMessages(rawMessages as any);
   const lastProcessed = cursor?.lastProcessedTs ?? 0;
   const newMessages = messages.filter((m) => m.ts > lastProcessed);
   const contextTail = messages.filter((m) => cursor && m.ts <= lastProcessed).slice(-20);
   if (newMessages.length === 0 && !force) {
     if (cursor) {
-      await setCursor(chatId, {
+      await saveOpenLoopCursor({
         chatId,
         lastProcessedTs: cursor.lastProcessedTs,
-        lastProcessedMessageId: cursor.lastProcessedMessageId,
+        lastProcessedMessageId: cursor.lastProcessedMessageId ?? null,
         lastRunToTs: now,
-        updatedAt: Date.now(),
       });
     }
     if (process.env.DEBUG_INTEL === "1") {
@@ -502,6 +536,21 @@ export async function refreshEAOpenLoopsForChat(chatId: string, opts: { force?: 
   } catch (err) {
     console.error("[ea-openloops] failed to append debug run", err);
   }
+  try {
+    await saveDebugRunToDb({
+      chatId,
+      ts: runRecord.ts,
+      runType,
+      fromTs: runRecord.fromTs,
+      toTs: runRecord.toTs,
+      messageCount: runRecord.messageCount,
+      rawOpenLoops: runRecord.rawOpenLoops,
+      sanitizedOpenLoops: runRecord.sanitizedOpenLoops,
+      dropped: runRecord.dropped,
+    });
+  } catch (err) {
+    console.error("[ea-openloops] failed to dual-write debug run", err);
+  }
 
   if (process.env.DEBUG_INTEL === "1") {
     console.info("[ea-openloops] after sanitize", {
@@ -514,8 +563,8 @@ export async function refreshEAOpenLoopsForChat(chatId: string, opts: { force?: 
       contextCount: contextTail.length,
       lastProcessedTsBefore: cursor?.lastProcessedTs,
       lastProcessedTsAfter: newMessages.length ? Math.max(...newMessages.map((m) => m.ts)) : cursor?.lastProcessedTs,
-      truncated: fetchResult.truncated,
-      total: fetchResult.total,
+      truncated: false,
+      total: rawMessages.length,
     });
     if ((result.openLoops?.length ?? 0) > 0 && openLoops.length === 0) {
       const topDrops = sanitizedResult.dropped.slice(0, 2).map((d) => d.reason);
@@ -546,24 +595,26 @@ export async function refreshEAOpenLoopsForChat(chatId: string, opts: { force?: 
     modelUsed: getModelName("openLoops"),
   };
 
-  if (force) await clearChatEAState(chatId);
-  await upsertChatEAState(state);
+  await saveActiveLoopsToDb(openLoops as any, "ea_v2");
+
+  if (!dbOnly) {
+    if (force) await clearChatEAState(chatId);
+    await upsertChatEAState(state);
+  }
   if (newMessages.length) {
     const newCursorTs = Math.max(...newMessages.map((m) => m.ts));
-    await setCursor(chatId, {
+    await saveOpenLoopCursor({
       chatId,
       lastProcessedTs: newCursorTs,
       lastProcessedMessageId: newMessages[newMessages.length - 1]?.id,
       lastRunToTs: now,
-      updatedAt: Date.now(),
     });
   } else {
-    await setCursor(chatId, {
+    await saveOpenLoopCursor({
       chatId,
       lastProcessedTs: cursor?.lastProcessedTs ?? sinceTs,
       lastProcessedMessageId: cursor?.lastProcessedMessageId,
       lastRunToTs: now,
-      updatedAt: Date.now(),
     });
   }
   return state;
@@ -571,17 +622,16 @@ export async function refreshEAOpenLoopsForChat(chatId: string, opts: { force?: 
 
 export async function refreshEAOpenLoopsForRecentChats(
   hours: number,
-  opts: { force?: boolean; maxChats?: number; maxNewMessages?: number; runType?: "morning" | "evening" | "manual" } = {}
+  opts: { force?: boolean; maxChats?: number; maxNewMessages?: number; runType?: "morning" | "evening" | "manual"; includeGroups?: boolean } = {}
 ) {
   const force = !!opts.force;
   const maxChats = opts.maxChats ?? 50;
   const maxNewMessages = opts.maxNewMessages ?? 5000;
   const runType = deriveRunType(opts.runType);
+  const includeGroups = opts.includeGroups ?? true;
   const sinceTs = Date.now() - hours * 60 * 60 * 1000;
-  const meta: FetchResult = await fetchMessagesSinceWithMeta(sinceTs, maxNewMessages).catch(
-    () => ({ messages: [] } as FetchResult)
-  );
-  let rawMessages = meta.messages ?? [];
+  const recent = await getRecentMessagesSince(sinceTs, maxNewMessages, includeGroups);
+  let rawMessages = recent ?? [];
   rawMessages.sort((a, b) => a.ts - b.ts);
 
   const byChat = new Map<string, number>();
@@ -592,10 +642,12 @@ export async function refreshEAOpenLoopsForRecentChats(
     .sort((a, b) => b[1] - a[1])
     .slice(0, maxChats)
     .map(([chatId]) => chatId);
+  const groupChatsCount = chats.filter((c) => c.endsWith("@g.us")).length;
+  console.info("[ea-openloops] refresh selection", { includeGroups, groupChatsSelected: groupChatsCount, totalChats: chats.length });
 
   const results: ChatEAState[] = [];
   let totalFetchedMessages = rawMessages.length;
-  let truncatedChatsCount = meta.truncated || meta.hasMore ? 1 : 0;
+  let truncatedChatsCount = 0;
   for (const chatId of chats) {
     const state = await refreshEAOpenLoopsForChat(chatId, { force, maxNewMessages, runType, hours });
     if (state) results.push(state);

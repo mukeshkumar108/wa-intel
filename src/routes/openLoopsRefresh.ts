@@ -17,7 +17,8 @@ openLoopsRefreshRouter.post("/open-loops/refresh", async (req, res) => {
     const runType = (req.query.runType as string | undefined) as any;
     const limitParam = Number(req.query.limit ?? 5000);
     const maxNewMessages = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 5000;
-    const results = await refreshEAOpenLoopsForRecentChats(hours, { force, runType, maxNewMessages });
+    const includeGroups = String(req.query.includeGroups ?? "true").toLowerCase() === "true";
+    const results = await refreshEAOpenLoopsForRecentChats(hours, { force, runType, maxNewMessages, includeGroups });
     const artifactPayload = {
       runId,
       windowHours: hours,

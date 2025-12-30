@@ -10,6 +10,17 @@
 - **Targets state (Service A)**: visible in Service A `/api/debug/state.backfillTargets` (or equivalent).
 - **Artifacts/runs**: `intel_runs`, `intel_artifacts` for audit history; state file `out/intel/orchestrator_state.json` is observational only.
 
+## Ops/debug overview
+- Service B orchestrates by pulling coverage/status + messages from Service A and writing plan/result artifacts to `intel_artifacts` (`action_plan_snapshot`, `action_plan_result`) and evidence rows to `intel_events.backfill_target_posted`.
+- Cooldown gating only checks `intel_events.backfill_target_posted` within `ORCH_TARGET_COOLDOWN_MS` (env); `targetsPosted` should mirror those events.
+- Debug a run:
+  1) Run orchestrate with debug: `curl -s -X POST -H "${AUTH_HEADER:-Authorization: Bearer test-key}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/orchestrate/run?runType=manual&debug=true" | jq`.
+  2) Note `planArtifactId` and fetch it: `curl -s -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/artifacts/${planArtifactId}" | jq`.
+  3) Latest plan: `curl -s -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/artifacts/latest?type=plan" | jq`.
+  4) Interpret gating: `targetDecisions` shows candidates, filters, cooldown/priority reasons (`dropReasons`, `cooldownRemainingMs`, `eventPriority`), and which chats were posted (`posted=true`).
+  5) Verify cooldown evidence by chat: `curl -s -H "${AUTH_HEADER}" "${SERVICE_B_BASE_URL:-http://localhost:4000}/intel/chat/$CHAT_ID/latest" | jq '{artifacts,eventCounts}'` (counts include `backfill_target_posted` from the last 7d).
+  6) Service A reachability errors return `ok=false` with `error=service_a_unreachable` instead of hanging.
+
 ## Health + single-chat verification (copy/paste)
 ```bash
 # Env you can override:

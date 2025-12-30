@@ -7,6 +7,7 @@ import { callLLM } from "../llm.js";
 import { buildSignalsEventsPrompt, SignalsChat } from "../prompts.js";
 import { fetchChatMessagesBefore, fetchServiceStatus, getCoverageStatus } from "../whatsappClient.js";
 import { startRun, saveArtifact, finishRun, saveEvents } from "./intelPersistence.js";
+import { saveSystemHeartbeat } from "./healthPersistence.js";
 
 type InfillResult = { complete: boolean; reason: "coverageOk" | "fallbackOk" | "notReady"; seedExists: boolean; coverageOk: boolean; fallbackOk: boolean };
 
@@ -280,6 +281,16 @@ async function tick() {
   state.serviceAStatusCheckedAt = now;
   if (ready && !state.serviceAReadyAt) state.serviceAReadyAt = now;
   writeOrchestratorState(state);
+  try {
+    await saveSystemHeartbeat({
+      service_a_status: statusJson,
+      orchestrator_state: state,
+      last_run_ts: now,
+      last_error: (state.lastErrors ?? []).slice(-1)[0] ?? null,
+    });
+  } catch (err) {
+    console.error("[scheduler] heartbeat write failed", err);
+  }
 
   if (prevReady !== ready) {
     console.info(`[orch tick=${tickId}] readiness changed`, { reachable, ready, reason: readyReason });

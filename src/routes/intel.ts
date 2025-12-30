@@ -23,7 +23,16 @@ import { readOrchestratorState, buildSchedulerStatus } from "../services/orchest
 import { enqueueJob } from "../services/jobQueue.js";
 import { getChatState, upsertChatState } from "../services/chatPipelineState.js";
 import { getRecentHighSignalChatIds } from "../services/intelPersistence.js";
-import { setBackfillTargets } from "../whatsappClient.js";
+import { setBackfillTargets, fetchActiveChats } from "../whatsappClient.js";
+import { queueBackfillTargets, updateBackfillStatus } from "../services/backfillPersistence.js";
+import { saveMessages } from "../services/dataPersistence.js";
+import { getRecentMessagesSince, FlatMessage } from "../intel/messageStore.js";
+
+const MAX_BACKFILL_LIMIT = (() => {
+  const n = Number(process.env.MAX_BACKFILL_LIMIT ?? 5000);
+  if (!Number.isFinite(n) || n <= 0) return 5000;
+  return n;
+})();
 
 async function fetchLatestArtifactPreview(artifactType: string) {
   try {
@@ -81,6 +90,27 @@ async function fetchLatestArtifactPreview(artifactType: string) {
     console.error("[intel/today] fetchLatestArtifactPreview failed", err);
     return null;
   }
+}
+
+function mapArtifactRow(row: any) {
+  return {
+    id: row?.id ?? null,
+    runId: row?.run_id ?? row?.runId ?? null,
+    artifactType: row?.artifact_type ?? row?.artifactType ?? null,
+    chatId: row?.chat_id ?? row?.chatId ?? null,
+    createdAt: row?.created_at ?? row?.createdAt ?? null,
+    payload: row?.payload ?? null,
+  };
+}
+
+function resolveArtifactType(raw: any): string | null {
+  if (!raw) return "action_plan_snapshot";
+  const value = Array.isArray(raw) ? raw[0] : String(raw);
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return "action_plan_snapshot";
+  if (normalized === "plan") return "action_plan_snapshot";
+  if (normalized === "result") return "action_plan_result";
+  return normalized;
 }
 
 async function fetchRecentRuns() {
@@ -303,6 +333,40 @@ intelRouter.get("/intel/orchestrate/explain", async (_req, res) => {
   } catch (err: any) {
     console.error("Error in /intel/orchestrate/explain:", err);
     res.status(500).json({ error: "Failed to load action plan" });
+  }
+});
+
+intelRouter.get("/intel/artifacts/latest", async (req, res) => {
+  const artifactType = resolveArtifactType(req.query.type);
+  if (!artifactType) return res.status(400).json({ error: "Unknown artifact type" });
+  try {
+    const result = await pool.query(
+      "SELECT id, run_id, artifact_type, chat_id, payload, created_at FROM intel_artifacts WHERE artifact_type = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+      [artifactType]
+    );
+    const row = result.rows?.[0];
+    if (!row) return res.status(404).json({ error: "Artifact not found" });
+    res.json(mapArtifactRow(row));
+  } catch (err: any) {
+    console.error("Error in /intel/artifacts/latest:", err);
+    res.status(500).json({ error: "Failed to load latest artifact" });
+  }
+});
+
+intelRouter.get("/intel/artifacts/:id", async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Invalid artifact id" });
+  try {
+    const result = await pool.query(
+      "SELECT id, run_id, artifact_type, chat_id, payload, created_at FROM intel_artifacts WHERE id = $1",
+      [id]
+    );
+    const row = result.rows?.[0];
+    if (!row) return res.status(404).json({ error: "Artifact not found" });
+    res.json(mapArtifactRow(row));
+  } catch (err: any) {
+    console.error("Error in /intel/artifacts/:id:", err);
+    res.status(500).json({ error: "Failed to load artifact" });
   }
 });
 
@@ -539,6 +603,7 @@ intelRouter.get("/intel/coverage/active", async (req, res) => {
 });
 
 intelRouter.post("/intel/signals/run", async (req, res) => {
+  const dbOnlyIntel = String(process.env.DB_INTEL_ONLY ?? "false").toLowerCase() === "true";
   const runId = await startRun({
     kind: "signals_run",
     runType: (req.query.runType as string | undefined) ?? "manual",
@@ -554,7 +619,7 @@ intelRouter.post("/intel/signals/run", async (req, res) => {
 
     const now = Date.now();
     const cutoffTs = now - hours * 60 * 60 * 1000;
-    const recent = await fetchRecentMessages(5000);
+    const recent = await getRecentMessagesSince(cutoffTs, 5000, includeGroups);
     const grouped = new Map<string, SignalsChat>();
 
     for (const m of recent) {
@@ -570,7 +635,7 @@ intelRouter.post("/intel/signals/run", async (req, res) => {
       }
       entry.messageCount++;
       if (entry.messages.length < perChat) {
-        entry.messages.push({ ts: m.ts, fromMe: m.fromMe, body: m.body, type: m.type });
+        entry.messages.push({ ts: m.ts, fromMe: m.fromMe, body: m.body, type: m.type ?? "chat" });
       }
     }
 
@@ -578,6 +643,18 @@ intelRouter.post("/intel/signals/run", async (req, res) => {
       .filter((c) => c.messageCount >= minMsgs)
       .sort((a, b) => b.messageCount - a.messageCount)
       .slice(0, maxChats);
+    if (dbOnlyIntel && chats.length === 0) {
+      const payload = {
+        ok: true,
+        reasonCode: "INSUFFICIENT_DB_CONTEXT",
+        chatsChecked: grouped.size,
+        chatsWithMinContext: 0,
+        windowHours: hours,
+      };
+      await saveArtifact({ runId, artifactType: "signals_snapshot", payload });
+      await finishRun(runId, { status: "ok" });
+      return res.json(payload);
+    }
 
     const prompt = buildSignalsDigestPrompt({ windowHours: hours, generatedAtTs: now, chats });
     let llmResp: any;
@@ -601,6 +678,7 @@ intelRouter.post("/intel/signals/run", async (req, res) => {
 });
 
 intelRouter.post("/intel/signals/events/run", async (req, res) => {
+  const dbOnlyIntel = String(process.env.DB_INTEL_ONLY ?? "false").toLowerCase() === "true";
   const runId = await startRun({
     kind: "signals_run",
     runType: (req.query.runType as string | undefined) ?? "manual",
@@ -618,7 +696,19 @@ intelRouter.post("/intel/signals/events/run", async (req, res) => {
 
     const nowTs = Date.now();
     const cutoffTs = nowTs - hours * 60 * 60 * 1000;
-    const recent = await fetchRecentMessages(recentLimit);
+    const recent = await getRecentMessagesSince(cutoffTs, recentLimit, includeGroups);
+    if (dbOnlyIntel && recent.length === 0) {
+      const payload = {
+        ok: true,
+        reasonCode: "INSUFFICIENT_DB_CONTEXT",
+        chatsChecked: 0,
+        chatsWithMinContext: 0,
+        windowHours: hours,
+      };
+      await saveArtifact({ runId, artifactType: "signals_events_snapshot", payload });
+      await finishRun(runId, { status: "ok" });
+      return res.json(payload);
+    }
     const grouped = new Map<string, SignalsChat>();
     let minInputMsgTs: number | null = null;
     let maxInputMsgTs: number | null = null;
@@ -638,7 +728,7 @@ intelRouter.post("/intel/signals/events/run", async (req, res) => {
       }
       entry.messageCount++;
       if (entry.messages.length < perChat) {
-        entry.messages.push({ ts: m.ts, fromMe: m.fromMe, body: m.body, type: m.type });
+        entry.messages.push({ ts: m.ts, fromMe: m.fromMe, body: m.body, type: m.type ?? "chat" });
       }
     }
 
@@ -651,6 +741,18 @@ intelRouter.post("/intel/signals/events/run", async (req, res) => {
         return bLatest - aLatest;
       })
       .slice(0, maxChats);
+    if (dbOnlyIntel && chats.length === 0) {
+      const payload = {
+        ok: true,
+        reasonCode: "INSUFFICIENT_DB_CONTEXT",
+        chatsChecked: grouped.size,
+        chatsWithMinContext: 0,
+        windowHours: hours,
+      };
+      await saveArtifact({ runId, artifactType: "signals_events_snapshot", payload });
+      await finishRun(runId, { status: "ok" });
+      return res.json(payload);
+    }
 
     const prompt = buildSignalsEventsPrompt({ windowHours: hours, generatedAtTs: nowTs, maxEvents, chats });
     let llmResp: any;
@@ -781,10 +883,16 @@ intelRouter.post("/intel/watermarks/sync", async (req, res) => {
     runType: (req.query.runType as string | undefined) ?? "scheduled",
     params: req.query,
   });
+  const SYNC_MAX_CHATS = (() => {
+    const raw = Number(process.env.SYNC_MAX_CHATS ?? 1000);
+    if (!Number.isFinite(raw) || raw <= 0) return 1000;
+    return raw;
+  })();
+  const DEFAULT_ACTIVE_DAYS = 90;
   try {
-    const activeDays = Math.min(Number(req.query.activeDays ?? 30) || 30, 365);
+    const activeDays = Math.min(Number(req.query.activeDays ?? DEFAULT_ACTIVE_DAYS) || DEFAULT_ACTIVE_DAYS, 365);
     const recentLimit = Math.min(Number(req.query.recentLimit ?? 4000) || 4000, 20000);
-    const maxChats = Math.min(Number(req.query.maxChats ?? 30) || 30, 200);
+    const maxChats = Math.min(Number(req.query.maxChats ?? SYNC_MAX_CHATS) || SYNC_MAX_CHATS, SYNC_MAX_CHATS);
     const runType = (req.query.runType as string | undefined) ?? "scheduled";
     const includeGroups = String(req.query.includeGroups ?? "false").toLowerCase() === "true";
     const now = Date.now();
@@ -819,11 +927,28 @@ intelRouter.post("/intel/watermarks/sync", async (req, res) => {
     let updated = 0;
     let enqueuedMetrics = 0;
     let enqueuedSignals = 0;
+    const hydrationMetrics: any[] = [];
 
     for (const chatId of candidates) {
       checked++;
-      const { messages } = await fetchChatMessagesBefore(chatId, now, 200).catch(() => ({ messages: [] as any[] }));
+      const { messages } = await fetchChatMessagesBefore(chatId, now, 5000).catch(() => ({ messages: [] as any[] }));
       if (!messages.length) continue;
+      const fetchedCount = messages.length;
+      const ids = Array.from(new Set(messages.map((m: any) => m.id).filter(Boolean)));
+      let existing = 0;
+      if (ids.length) {
+        const existingRes = await pool.query("SELECT COUNT(*) AS cnt FROM messages WHERE id = ANY($1)", [ids]);
+        existing = Number(existingRes.rows?.[0]?.cnt ?? 0);
+      }
+      const inserted = Math.max(0, ids.length - existing);
+      const deduped = Math.max(0, ids.length - inserted);
+      const dropped = 0;
+      const droppedReasons: string[] = [];
+      try {
+        await saveMessages(chatId, messages as any);
+      } catch (err) {
+        console.error("[intel/watermarks/sync] saveMessages failed", err);
+      }
       const newestTs = Math.max(...messages.map((m) => m.ts));
       const oldestTs = Math.min(...messages.map((m) => m.ts));
       const state = await getChatState(chatId);
@@ -842,6 +967,13 @@ intelRouter.post("/intel/watermarks/sync", async (req, res) => {
         last_run_type: runType,
       });
       updated++;
+      try {
+        await updateBackfillStatus(chatId, "completed");
+      } catch (err) {
+        console.error("[intel/watermarks/sync] updateBackfillStatus failed", err);
+      }
+      hydrationMetrics.push({ chatId, fetched: fetchedCount, inserted, deduped, dropped, droppedReasons });
+      console.info("[hydrate] backfill stats", { chatId, fetched: fetchedCount, inserted, deduped, dropped, droppedReasons });
 
       if (movedBack || crossedThreshold) {
         await enqueueJob("metrics_daily_chat", { chatId, windows: "1d,7d,30d" }, `metrics_daily_${chatId}`);
@@ -851,7 +983,7 @@ intelRouter.post("/intel/watermarks/sync", async (req, res) => {
       }
     }
 
-    const payload = { now, activeDays, recentLimit, maxChats, checked, updated, enqueuedMetrics, enqueuedSignals };
+    const payload = { now, activeDays, recentLimit, maxChats, checked, updated, enqueuedMetrics, enqueuedSignals, hydrationMetrics };
     await saveArtifact({ runId, artifactType: "watermarks_sync_result", payload });
     await finishRun(runId, { status: "ok" });
     res.json(payload);
@@ -859,6 +991,101 @@ intelRouter.post("/intel/watermarks/sync", async (req, res) => {
     await finishRun(runId, { status: "error", error: err?.message ?? String(err) });
     console.error("Error in /intel/watermarks/sync:", err);
     res.status(500).json({ error: "Failed to sync watermarks" });
+  }
+});
+
+// Explicit hydration: pull chats/messages from Service A into Postgres
+intelRouter.post("/intel/hydrate/run", async (req, res) => {
+  const HYDRATE_ALL_CHATS = String(process.env.HYDRATE_ALL_CHATS ?? "false").toLowerCase() === "true";
+  if (!HYDRATE_ALL_CHATS) return res.status(400).json({ error: "HYDRATE_ALL_CHATS not enabled" });
+  const runId = await startRun({
+    kind: "hydrate_run",
+    runType: (req.query.runType as string | undefined) ?? "manual",
+    params: req.query,
+  });
+  try {
+    const limitChats = Math.min(Number(req.query.limitChats ?? 2000) || 2000, 5000);
+    const perChat = Math.min(Number(req.query.perChat ?? 500) || 500, 5000);
+    const includeGroups = String(req.query.includeGroups ?? "true").toLowerCase() === "true";
+    const startTs = Date.now();
+
+    const svcChats = await fetchActiveChats(limitChats, includeGroups);
+    const chatIds = Array.from(new Set((svcChats ?? []).map((c) => c.chatId).filter(Boolean))).slice(0, limitChats);
+
+    let serviceAChatsSeen = chatIds.length;
+    let serviceAGroupChatsSeen = chatIds.filter((c) => c.endsWith("@g.us")).length;
+    let chatsHydrated = 0;
+    let messagesFetched = 0;
+    let messagesInserted = 0;
+    let messagesDeduped = 0;
+    const errorsByChat: Record<string, string> = {};
+    const hydrationMetrics: any[] = [];
+
+    for (const chatId of chatIds) {
+      try {
+        const { messages } = await fetchChatMessagesBefore(chatId, Date.now(), perChat).catch(() => ({ messages: [] as any[] }));
+        if (!messages?.length) continue;
+        messagesFetched += messages.length;
+        const ids = Array.from(new Set(messages.map((m: any) => m.id).filter(Boolean)));
+        let existing = 0;
+        if (ids.length) {
+          const existingRes = await pool.query("SELECT COUNT(*) AS cnt FROM messages WHERE id = ANY($1)", [ids]);
+          existing = Number(existingRes.rows?.[0]?.cnt ?? 0);
+        }
+        const inserted = Math.max(0, ids.length - existing);
+        messagesInserted += inserted;
+        messagesDeduped += Math.max(0, ids.length - inserted);
+        await saveMessages(chatId, messages as any);
+        chatsHydrated++;
+        hydrationMetrics.push({
+          chatId,
+          fetched: messages.length,
+          inserted,
+          deduped: Math.max(0, ids.length - inserted),
+          dropped: 0,
+          droppedReasons: [],
+        });
+      } catch (err: any) {
+        errorsByChat[chatId] = err?.message ?? String(err);
+      }
+    }
+
+    const dbChatsRes = await pool.query("SELECT COUNT(DISTINCT chat_id) AS chats, COUNT(DISTINCT chat_id) FILTER (WHERE chat_id LIKE '%@g.us') AS group_chats FROM messages");
+    const dbMsgsRes = await pool.query("SELECT COUNT(*) AS messages, COUNT(*) FILTER (WHERE chat_id LIKE '%@g.us') AS group_messages FROM messages");
+    const dbChatsCount = Number(dbChatsRes.rows?.[0]?.chats ?? 0);
+    const dbGroupChatsCount = Number(dbChatsRes.rows?.[0]?.group_chats ?? 0);
+    const dbMessagesCount = Number(dbMsgsRes.rows?.[0]?.messages ?? 0);
+    const dbGroupMessagesCount = Number(dbMsgsRes.rows?.[0]?.group_messages ?? 0);
+
+    const presentRes = await pool.query("SELECT DISTINCT chat_id FROM messages");
+    const presentSet = new Set((presentRes.rows ?? []).map((r: any) => r.chat_id));
+    const missingChatIds = chatIds.filter((c) => !presentSet.has(c)).length;
+
+    const payload = {
+      ok: true,
+      serviceAChatsSeen,
+      serviceAGroupChatsSeen,
+      chatsAttempted: chatIds.length,
+      chatsHydrated,
+      messagesFetched,
+      messagesInserted,
+      messagesDeduped,
+      groupsInserted: dbGroupChatsCount,
+      errorsByChat: { count: Object.keys(errorsByChat).length, sample: Object.entries(errorsByChat).slice(0, 5) },
+      dbChatsCount,
+      dbMessagesCount,
+      dbGroupMessagesCount,
+      missingChatIds,
+      durationMs: Date.now() - startTs,
+      hydrationMetrics,
+    };
+    await saveArtifact({ runId, artifactType: "hydrate_result", payload });
+    await finishRun(runId, { status: "ok" });
+    res.json(payload);
+  } catch (err: any) {
+    await finishRun(runId, { status: "error", error: err?.message ?? err });
+    console.error("Error in /intel/hydrate/run:", err);
+    res.status(500).json({ error: "Failed to hydrate" });
   }
 });
 
@@ -902,7 +1129,13 @@ intelRouter.post("/intel/backfill/chat/:chatId", async (req, res) => {
     params: req.query,
   });
   try {
-    const targetMessages = Math.max(50, Math.min(Number(req.query.targetMessages ?? 500) || 500, 500));
+    const parsed = Number(req.query.targetMessages ?? MAX_BACKFILL_LIMIT);
+    const targetMessages = Math.max(50, Math.min(Number.isFinite(parsed) ? parsed : MAX_BACKFILL_LIMIT, MAX_BACKFILL_LIMIT));
+    try {
+      await queueBackfillTargets([chatId]);
+    } catch (err) {
+      console.error("[intel/backfill/chat] queueBackfillTargets failed", err);
+    }
     await setBackfillTargets([{ chatId, targetMessages }]);
     const now = Date.now();
     await saveBackfillPosts([{ chatId, ts: now }], null);

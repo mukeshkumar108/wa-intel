@@ -18,6 +18,7 @@ import { intelRouter } from "./routes/intel.js";
 import { uiRouter } from "./routes/ui.js";
 import { Request, Response, NextFunction } from "express";
 import { startOrchestratorScheduler } from "./services/orchestratorScheduler.js";
+import { runBootstrapMirrorIfNeeded } from "./services/bootstrapMirror.js";
 
 const app = express();
 
@@ -63,3 +64,4 @@ app.listen(config.port, () => {
 });
 
 startOrchestratorScheduler();
+runBootstrapMirrorIfNeeded();

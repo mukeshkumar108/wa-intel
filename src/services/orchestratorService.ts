@@ -1,6 +1,14 @@
 import fs from "fs";
 import path from "path";
-import { getCoverageStatus, setBackfillTargets, CoverageStatus, fetchActiveChats, fetchChatMessagesBefore, fetchServiceStatus } from "../whatsappClient.js";
+import {
+  getCoverageStatus,
+  setBackfillTargets,
+  CoverageStatus,
+  fetchServiceStatus,
+  isServiceATransientError,
+  fetchRecentMessages,
+  fetchChatMessagesBefore,
+} from "../whatsappClient.js";
 import type { MessageRecord } from "../types.js";
 import { callLLM } from "../llm.js";
 import { buildOrchestratorHeatPrompt, OrchestratorHeatChatSlice } from "../prompts.js";
@@ -12,6 +20,9 @@ import {
   getBackfillPostedEvidence,
   saveArtifact,
 } from "./intelPersistence.js";
+import { queueBackfillTargets } from "./backfillPersistence.js";
+import { getHighHeatChats, getMessageCount } from "../intel/messageStore.js";
+import { getActiveChats as getActiveChatsFromDb, getRecentMessages } from "../intel/messageStore.js";
 
 export type OrchestratorState = {
   lastRunAt?: number;
@@ -46,9 +57,18 @@ const RUNS_PATH = path.join(OUT_DIR, "orchestrator_runs.jsonl");
 const HEAT_LATEST_PATH = path.join(OUT_DIR, "heat_latest.json");
 const HEAT_RUNS_PATH = path.join(OUT_DIR, "heat_runs.jsonl");
 const MIN_DIRECT_COVERAGE_PCT = Number(process.env.ORCH_MIN_DIRECT_COVERAGE_PCT ?? process.env.MIN_DIRECT_COVERAGE_PCT ?? 70);
+const MAX_BACKFILL_LIMIT = (() => {
+  const n = Number(process.env.MAX_BACKFILL_LIMIT ?? 5000);
+  if (!Number.isFinite(n) || n <= 0) return 5000;
+  return n;
+})();
 const ORCH_HIGH_TARGET = Number(process.env.ORCH_HIGH_TARGET ?? 300);
 const ORCH_MED_TARGET = Number(process.env.ORCH_MED_TARGET ?? 150);
-const ORCH_MAX_TARGET = Number(process.env.ORCH_MAX_TARGET ?? 500);
+const ORCH_MAX_TARGET = (() => {
+  const n = Number(process.env.ORCH_MAX_TARGET ?? MAX_BACKFILL_LIMIT);
+  if (!Number.isFinite(n) || n <= 0) return MAX_BACKFILL_LIMIT;
+  return n;
+})();
 const ORCH_EVENT_PRIORITY_ENABLED = String(process.env.ORCH_EVENT_PRIORITY_ENABLED ?? "true").toLowerCase() === "true";
 const ORCH_EVENT_PRIORITY_HOURS = Number(process.env.ORCH_EVENT_PRIORITY_HOURS ?? 72);
 const ORCH_EVENT_PRIORITY_MAX_CHATS = Number(process.env.ORCH_EVENT_PRIORITY_MAX_CHATS ?? 20);
@@ -60,6 +80,13 @@ const ORCH_MIN_STARTUP_MESSAGES = Number(process.env.ORCH_MIN_STARTUP_MESSAGES ?
 const DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const parsedCooldown = Number(process.env.ORCH_TARGET_COOLDOWN_MS ?? DEFAULT_COOLDOWN_MS);
 const ORCH_TARGET_COOLDOWN_MS = Number.isFinite(parsedCooldown) && parsedCooldown >= 0 ? parsedCooldown : DEFAULT_COOLDOWN_MS;
+const dbIntelOnly = String(process.env.DB_INTEL_ONLY ?? "false").toLowerCase() === "true";
+
+function forbiddenPlanningFetch() {
+  if (dbIntelOnly) {
+    throw new Error("PLANNING_PHASE_SERVICE_A_MESSAGE_FETCH_FORBIDDEN");
+  }
+}
 
 function getOffsetMinutes(tz: string, date: Date): number {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -314,17 +341,35 @@ export async function orchestrateRun(opts: {
     startupInfillError,
   };
 
-  if (!connected) {
+  const finishWithServiceAError = (code: string, err?: any) => {
+    const message = err?.message ?? String(err ?? code);
     const result = {
-      skipped: "service_a_not_connected",
-      serviceA: serviceAInfo,
-      eventPriority,
+      ok: false,
+      error: code,
+      errorMessage: message,
+      postedMode: "none",
       targetsPlanned: 0,
       targetsPosted: 0,
-      postedMode: "none",
+      eventPriority,
+      serviceA: serviceAInfo,
     };
+    state.lastRunAt = now;
+    state.lastRunType = runType;
+    state.lastResult = result;
+    state.lastOrchestrateAt = now;
+    const prevErrors = state.lastErrors ?? [];
+    state.lastErrors = [...prevErrors.slice(-4), { ts: now, message: `${code}:${message}` }];
+    writeOrchestratorState(state);
     appendRun({ ts: now, runType, result, serviceA: serviceAInfo });
     return result;
+  };
+
+  if (statusError) {
+    return finishWithServiceAError(isServiceATransientError(statusError) ? "service_a_unreachable" : "service_a_status_failed", statusError);
+  }
+
+  if (!connected) {
+    return finishWithServiceAError("service_a_not_connected");
   }
 
   let startupWarning = false;
@@ -359,16 +404,7 @@ export async function orchestrateRun(opts: {
   }
 
   let coverage: CoverageStatus | undefined;
-  try {
-    coverage = await getCoverageStatus();
-    state.lastCoverage = coverage;
-    state.lastCheckedAt = now;
-  } catch (err: any) {
-    // non-fatal; proceed with whatever data we have
-    console.error("[orchestrator] coverage_fetch_failed", err);
-  }
-
-  const coverageTargets = computeTargets(coverage);
+  const coverageTargets: { chatId: string; targetMessages: number }[] = [];
   const coverageTargetMap = new Map<string, number>();
   for (const t of coverageTargets) coverageTargetMap.set(t.chatId, t.targetMessages);
   const debugPosting = debug
@@ -382,20 +418,28 @@ export async function orchestrateRun(opts: {
     : null;
 
   // Build chat slices for LLM triage
-  const activeChats = await fetchActiveChats(limitChats, false);
-  const filteredChats = activeChats.filter((c) => c.chatId !== "status@broadcast" && !c.chatId.endsWith("@g.us") && !c.isGroup);
+  const activeChats = await getActiveChatsFromDb(limitChats);
+  const filteredChats = activeChats.filter((c) => {
+    const chatId = c.chatId;
+    if (!chatId) return false;
+    if (chatId === "status@broadcast") return false;
+    if (chatId.endsWith("@g.us")) return false;
+    if (chatId.includes("@broadcast")) return false;
+    return true;
+  });
   const chatSlices: OrchestratorHeatChatSlice[] = [];
   for (const chat of filteredChats) {
-    const { messages } = await fetchChatMessagesBefore(chat.chatId, 0, limitPerChat).catch(() => ({ messages: [] as MessageRecord[] }));
+    const msgs = await getRecentMessages(chat.chatId, limitPerChat);
+    if (msgs.length === 0) continue;
     chatSlices.push({
       chatId: chat.chatId,
-      chatDisplayName: chat.displayName ?? chat.chatId,
-      messages: messages
-        .sort((a, b) => a.ts - b.ts)
-        .map((m) => ({
+      chatDisplayName: chat.chatId,
+      messages: msgs
+        .sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0))
+        .map((m: any) => ({
           speaker: m.fromMe ? "ME" : "OTHER",
-          type: m.type,
-          body: m.body === null || m.body === undefined || m.body === "" ? `[media:${m.type}]` : m.body,
+          type: m.type ?? "chat",
+          body: m.body === null || m.body === undefined || m.body === "" ? `[media:${m.type ?? "chat"}]` : m.body,
           ts: m.ts,
         })),
     });
@@ -433,6 +477,33 @@ export async function orchestrateRun(opts: {
       target = Math.min(target, maxTargetFromCoverage);
       plannedTargets.push({ chatId: r.chatId, targetMessages: target });
     }
+  }
+
+  // High-heat priority from latest radar artifact + DB message counts
+  try {
+    const highHeatChats = await getHighHeatChats(100);
+    for (const hh of highHeatChats) {
+      const chatId = hh.chatId;
+      if (!chatId) continue;
+      let count = 0;
+      try {
+        count = await getMessageCount(chatId);
+      } catch (err) {
+        console.error("[orchestrator] getMessageCount failed", err);
+      }
+      const suggested = count < 50 ? 100 : count < 500 ? 500 : null;
+      if (!suggested) continue;
+      const existing = plannedTargets.find((t) => t.chatId === chatId);
+      if (existing) {
+        if (suggested > existing.targetMessages) {
+          existing.targetMessages = suggested;
+        }
+      } else {
+        plannedTargets.unshift({ chatId, targetMessages: suggested });
+      }
+    }
+  } catch (err) {
+    console.error("[orchestrator] high-heat priority failed", err);
   }
 
   // Event-driven prioritization
@@ -475,7 +546,7 @@ export async function orchestrateRun(opts: {
     cooldown_active: 0,
     missing_satisfaction_reason: 0,
   };
-  const targetDecisions = plannedChatIds.map((chatId) => {
+  const targetDecisions = await Promise.all(plannedChatIds.map(async (chatId) => {
     const plannedTarget = plannedTargets.find((t) => t.chatId === chatId);
     const targetMessages = plannedTarget?.targetMessages ?? coverageTargetMap.get(chatId) ?? null;
     const heat = heatMap.get(chatId);
@@ -487,9 +558,21 @@ export async function orchestrateRun(opts: {
     if (!Number.isFinite(targetMessages) || (targetMessages ?? 0) <= 0) {
       dropReasons.missingTargetMessages++;
     } else {
+      let dbCount = 0;
+      try {
+        dbCount = await getMessageCount(chatId);
+      } catch (err) {
+        console.error("[orchestrator] getMessageCount failed during satisfaction", err);
+      }
       const lastPostedAt = lastPostedMap[chatId] ?? null;
       const ageMs = lastPostedAt != null ? now - lastPostedAt : null;
-      if (lastPostedAt != null && ageMs != null && ageMs < ORCH_TARGET_COOLDOWN_MS) {
+      if (dbCount < (targetMessages ?? 0)) {
+        satisfaction = {
+          satisfied: false,
+          reason: null,
+          evidence: { dbCount, targetMessages },
+        };
+      } else if (lastPostedAt != null && ageMs != null && ageMs < ORCH_TARGET_COOLDOWN_MS) {
         satisfaction = {
           satisfied: true,
           reason: "cooldown_active",
@@ -498,6 +581,8 @@ export async function orchestrateRun(opts: {
             ageMs,
             cooldownMs: ORCH_TARGET_COOLDOWN_MS,
             cooldownRemainingMs: Math.max(0, ORCH_TARGET_COOLDOWN_MS - ageMs),
+            dbCount,
+            targetMessages,
           },
         };
         dropReasons.cooldown_active++;
@@ -527,7 +612,7 @@ export async function orchestrateRun(opts: {
       cooldownMs: ORCH_TARGET_COOLDOWN_MS,
       cooldownRemainingMs,
     };
-  });
+  }));
 
   const postCandidates = targetDecisions
     .filter((d) => d.planned && !d.satisfaction?.satisfied && Number.isFinite(d.coverage.baselineTarget) && (d.coverage.baselineTarget ?? 0) > 0)
@@ -650,6 +735,11 @@ export async function orchestrateRun(opts: {
   planArtifactId = await saveArtifact({ runId, artifactType: "action_plan_snapshot", payload: planPayload });
   try {
     if (postCandidates.length) {
+      try {
+        await queueBackfillTargets(postCandidates.map((t) => t.chatId));
+      } catch (err) {
+        console.error("[orchestrator] queueBackfillTargets failed", err);
+      }
       if (debugPosting) {
         debugPosting.attempted = true;
         debugPosting.payloadPreview = {

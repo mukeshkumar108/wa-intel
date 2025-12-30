@@ -2,48 +2,40 @@ import axios from "axios";
 import { config } from "./config.js";
 import { MessageRecord } from "./types.js";
 
+const SERVICE_A_TIMEOUT_MS = config.serviceATimeoutMs;
+const SERVICE_A_MAX_RETRIES = 2;
+const SERVICE_A_BACKOFF_MS = [200, 600];
+
 const client = axios.create({
   baseURL: config.whatsappBase,
-  timeout: 10_000,
+  timeout: SERVICE_A_TIMEOUT_MS,
 });
 
 // All calls to Service A are protected, so set the default Authorization header once.
 client.defaults.headers.common["Authorization"] = `Bearer ${config.whatsappApiKey}`;
 
-async function withRetry<T>(fn: () => Promise<T>, attempt = 1): Promise<T> {
-  try {
-    return await fn();
-  } catch (err: any) {
-    const status = err?.response?.status;
-    const retryable =
-      !status ||
-      status >= 500 ||
-      status === 502 ||
-      status === 503 ||
-      status === 504;
-    if (!retryable || attempt >= 3) {
-      throw err;
-    }
-    const backoffMs = [250, 750, 1500][attempt - 1] ?? 1500;
-    await new Promise((r) => setTimeout(r, backoffMs));
-    return withRetry(fn, attempt + 1);
-  }
+const transientCodes = new Set(["ECONNABORTED", "ECONNRESET", "ECONNREFUSED", "ENETDOWN", "ENETUNREACH", "EAI_AGAIN", "ETIMEDOUT"]);
+export function isServiceATransientError(err: any): boolean {
+  const status = err?.response?.status;
+  if (status && status < 500) return false;
+  const code = err?.code;
+  if (code && transientCodes.has(code)) return true;
+  const message = (err?.message ?? "").toLowerCase();
+  if (message.includes("timeout")) return true;
+  if (!status) return true;
+  return status >= 500;
 }
 
-function isTimeout(err: any): boolean {
-  return err?.code === "ECONNABORTED" || /timeout/i.test(err?.message ?? "");
-}
-
-async function withTimeoutRetry<T>(fn: () => Promise<T>): Promise<T> {
+async function withServiceARetry<T>(fn: () => Promise<T>, attempt = 0): Promise<T> {
   try {
     return await fn();
   } catch (err) {
-    if (isTimeout(err)) {
-      console.warn("[orchestrator] Service A call timeout, retrying once");
-      await new Promise((r) => setTimeout(r, 500));
-      return fn();
+    if (attempt >= SERVICE_A_MAX_RETRIES || !isServiceATransientError(err)) {
+      throw err;
     }
-    throw err;
+    const backoffMs = SERVICE_A_BACKOFF_MS[Math.min(attempt, SERVICE_A_BACKOFF_MS.length - 1)] ?? 250;
+    await new Promise((r) => setTimeout(r, backoffMs));
+    return withServiceARetry(fn, attempt + 1);
   }
 }
 
@@ -70,7 +62,7 @@ function parseMessagesResponse(data: MessagesResponse | MessageRecord[]): FetchR
 }
 
 export async function fetchRecentMessages(limit: number): Promise<MessageRecord[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/messages/recent", {
       params: { limit },
     })
@@ -86,7 +78,7 @@ export async function fetchChatMessages(
   limit: number,
   offset = 0
 ): Promise<MessageRecord[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get(`/api/messages/chat/${encodeURIComponent(chatId)}`, {
       params: { limit, offset },
     })
@@ -99,7 +91,7 @@ export async function fetchChatMessages(
 }
 
 export async function fetchMessagesSince(ts: number, limit = 2000): Promise<MessageRecord[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/messages/since", {
       params: { ts, limit },
     })
@@ -122,7 +114,7 @@ type ContactRecord = {
 };
 
 export async function fetchContacts(limit = 500): Promise<ContactRecord[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/contacts", {
       params: { limit },
     })
@@ -133,7 +125,7 @@ export async function fetchContacts(limit = 500): Promise<ContactRecord[]> {
 }
 
 export async function fetchMessagesBefore(ts: number, limit = 2000): Promise<FetchResult> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/messages/before", {
       params: { ts, limit },
     })
@@ -144,7 +136,7 @@ export async function fetchMessagesBefore(ts: number, limit = 2000): Promise<Fet
 }
 
 export async function fetchMessagesSinceWithMeta(ts: number, limit = 2000): Promise<FetchResult> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/messages/since", {
       params: { ts, limit },
     })
@@ -156,7 +148,7 @@ export async function fetchMessagesSinceWithMeta(ts: number, limit = 2000): Prom
 type ActiveChat = { chatId: string; isGroup?: boolean; displayName?: string | null; messageCount?: number | null };
 
 export async function fetchActiveChats(limit = 50, includeGroups = false): Promise<ActiveChat[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get("/api/chats/active", {
       params: { limit, includeGroups },
     })
@@ -167,7 +159,7 @@ export async function fetchActiveChats(limit = 50, includeGroups = false): Promi
 }
 
 export async function fetchChatMessagesSince(chatId: string, ts: number, limit = 200): Promise<MessageRecord[]> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get(`/api/messages/chat/${encodeURIComponent(chatId)}/since`, {
       params: { ts, limit },
     })
@@ -182,7 +174,7 @@ export async function fetchChatMessagesBefore(
   ts: number,
   limit = 200
 ): Promise<FetchResult> {
-  const res = await withRetry(() =>
+  const res = await withServiceARetry(() =>
     client.get(`/api/messages/chat/${encodeURIComponent(chatId)}/before`, {
       params: { ts, limit },
     })
@@ -192,11 +184,7 @@ export async function fetchChatMessagesBefore(
 }
 
 export async function fetchServiceStatus(): Promise<any> {
-  const res = await withTimeoutRetry(() =>
-    client.get("/status", {
-      timeout: 60_000,
-    })
-  );
+  const res = await withServiceARetry(() => client.get("/status"));
   return res.data;
 }
 
@@ -207,22 +195,18 @@ export interface CoverageStatus {
 }
 
 export async function getCoverageStatus(): Promise<CoverageStatus> {
-  const res = await withTimeoutRetry(() =>
-    client.get("/api/coverage/status", {
-      timeout: 60_000,
-    })
-  );
+  const res = await withServiceARetry(() => client.get("/api/coverage/status"));
   return res.data as CoverageStatus;
 }
 
 export async function setBackfillTargets(targets: { chatId: string; targetMessages: number }[]): Promise<void> {
-  await withTimeoutRetry(() =>
+  await withServiceARetry(() =>
     client.post(
       "/api/backfill/targets",
       {
         targets,
       },
-      { timeout: 60_000 }
+      { timeout: SERVICE_A_TIMEOUT_MS }
     )
   );
 }

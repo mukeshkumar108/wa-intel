@@ -16,6 +16,12 @@ export const config = {
   whatsappApiKey: requireEnv("WHATSAPP_API_KEY"),
   openRouterApiKey: requireEnv("OPENROUTER_API_KEY"),
   openRouterModel: process.env.OPENROUTER_MODEL ?? "openai/gpt-4.1-mini",
+  serviceATimeoutMs: (() => {
+    const raw = process.env.SERVICE_A_TIMEOUT_MS;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    return 10_000;
+  })(),
 };
 
 export function getUserTimezoneOffsetHours(): number {
