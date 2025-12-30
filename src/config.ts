@@ -22,6 +22,7 @@ export const config = {
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
     return 10_000;
   })(),
+  requireAuth: String(process.env.REQUIRE_AUTH ?? "false").toLowerCase() === "true" || process.env.NODE_ENV === "production",
 };
 
 export function getUserTimezoneOffsetHours(): number {

@@ -26,10 +26,14 @@ app.use(cors());
 app.use(express.json());
 
 const API_KEY = process.env.B_API_KEY;
+if (config.requireAuth && !API_KEY) {
+  throw new Error("B_API_KEY required when REQUIRE_AUTH=true or NODE_ENV=production");
+}
 function apiKeyMiddleware(req: Request, res: Response, next: NextFunction) {
   const path = req.path.toLowerCase();
-  if (path.startsWith("/health")) return next();
-  if (!API_KEY) return next();
+  const isPublic = path.startsWith("/health") || path.startsWith("/db/ping");
+  if (isPublic) return next();
+  if (!API_KEY) return res.status(401).json({ error: "Unauthorized" });
   const header = req.headers["authorization"];
   if (!header || !header.startsWith("Bearer ")) return res.status(401).json({ error: "Unauthorized" });
   const token = header.replace("Bearer ", "").trim();

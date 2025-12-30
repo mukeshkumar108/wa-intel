@@ -7,6 +7,7 @@ import { callLLM } from "../llm.js";
 import { buildSignalsEventsPrompt, SignalsChat } from "../prompts.js";
 import { fetchChatMessagesBefore, fetchServiceStatus, getCoverageStatus } from "../whatsappClient.js";
 import { startRun, saveArtifact, finishRun, saveEvents } from "./intelPersistence.js";
+import { pool } from "../db.js";
 import { saveSystemHeartbeat } from "./healthPersistence.js";
 
 type InfillResult = { complete: boolean; reason: "coverageOk" | "fallbackOk" | "notReady"; seedExists: boolean; coverageOk: boolean; fallbackOk: boolean };
@@ -238,11 +239,23 @@ function shouldRunDaily(state: OrchestratorState, now: number) {
 }
 
 async function tick() {
+  let lockAcquired = false;
   const tickId = ++tickSeq;
   const now = Date.now();
   const state = readOrchestratorState();
   state.lastTickAt = now;
   state.lastTickId = tickId;
+
+  try {
+    const res = await pool.query("SELECT pg_try_advisory_lock(50777) AS ok");
+    lockAcquired = res.rows?.[0]?.ok === true;
+  } catch (err) {
+    console.error("[scheduler] lock attempt failed", err);
+  }
+  if (!lockAcquired) {
+    console.warn("[scheduler] SKIP tick: lock held");
+    return;
+  }
 
   // 1) Readiness check via /status
   let statusJson: any = null;
@@ -380,6 +393,14 @@ async function tick() {
       }
     } catch (err: any) {
       console.warn("[job worker] tick error", err?.message ?? err);
+    }
+  }
+
+  if (lockAcquired) {
+    try {
+      await pool.query("SELECT pg_advisory_unlock(50777)");
+    } catch (err) {
+      console.error("[scheduler] failed to release lock", err);
     }
   }
 }

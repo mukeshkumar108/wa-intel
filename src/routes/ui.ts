@@ -2,6 +2,8 @@ import { Router } from "express";
 import fs from "fs";
 import path from "path";
 import { readOrchestratorState, buildSchedulerStatus } from "../services/orchestratorService.js";
+import { pool } from "../db.js";
+import { fetchServiceStatus } from "../whatsappClient.js";
 
 export const uiRouter = Router();
 
@@ -32,6 +34,36 @@ uiRouter.get("/ui/status", async (_req, res) => {
     digest_today: statInfo(path.join(process.cwd(), "out", "digest_today.json")),
   };
 
+  let dbRuns: any[] = [];
+  let artifacts: Record<string, any> = {};
+  try {
+    const runsRes = await pool.query(
+      "SELECT id, kind, status, error, started_at, finished_at FROM intel_runs ORDER BY id DESC LIMIT 10"
+    );
+    dbRuns = runsRes.rows ?? [];
+  } catch (err) {
+    dbRuns = [{ error: (err as any)?.message ?? String(err) }];
+  }
+  const artifactTypes = ["heat_triage_result", "signals_events_snapshot", "hydrate_result", "watermarks_sync_result"];
+  for (const t of artifactTypes) {
+    try {
+      const r = await pool.query(
+        "SELECT id, run_id, artifact_type, payload, created_at FROM intel_artifacts WHERE artifact_type = $1 ORDER BY created_at DESC, id DESC LIMIT 1",
+        [t]
+      );
+      artifacts[t] = r.rows?.[0] ?? null;
+    } catch (err) {
+      artifacts[t] = { error: (err as any)?.message ?? String(err) };
+    }
+  }
+
+  let serviceAStatus: any = null;
+  try {
+    serviceAStatus = await fetchServiceStatus();
+  } catch (err) {
+    serviceAStatus = { error: (err as any)?.message ?? String(err) };
+  }
+
   res.json({
     serviceB: {
       ok: true,
@@ -45,6 +77,13 @@ uiRouter.get("/ui/status", async (_req, res) => {
         }
       })(),
       uptimeMs: Math.round(process.uptime() * 1000),
+      flags: {
+        requireAuth: config.requireAuth,
+        dbIntelOnly: String(process.env.DB_INTEL_ONLY ?? "false").toLowerCase() === "true",
+        openLoopsDbOnly: String(process.env.OPEN_LOOPS_DB_ONLY ?? "false").toLowerCase() === "true",
+        hydrateAllChats: String(process.env.HYDRATE_ALL_CHATS ?? "false").toLowerCase() === "true",
+        bootstrapMirror: String(process.env.BOOTSTRAP_MIRROR ?? "false").toLowerCase() === "true",
+      },
     },
     scheduler: {
       enabled: scheduler.enabled,
@@ -61,8 +100,12 @@ uiRouter.get("/ui/status", async (_req, res) => {
       statusCheckedAt: state.serviceAStatusCheckedAt ?? null,
       readyAt: state.serviceAReadyAt ?? null,
       lastMessageAt: (state.lastCoverage as any)?.lastMessageTs ?? null,
+      status: serviceAStatus,
+      dependsOnServiceA: true,
     },
     coverage,
-    latest,
+    latest: { ...latest, orchestrator_state_age_ms: state?.lastCheckedAt ? now - state.lastCheckedAt : null },
+    runs: dbRuns,
+    artifacts,
   });
 });
